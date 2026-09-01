@@ -33,8 +33,18 @@ The model adapter looks for pickled or joblib-trained models in the standard loc
 ## Quick start
 
 ```bash
-python -m examples.quickstart
+python3 -m examples.quickstart
 ```
+
+## Live webcam mode
+
+This project can launch the trained ASL detector already implemented in the sibling `asl-training` project.
+
+```bash
+python3 -m examples.live_webcam
+```
+
+This wrapper resolves the sibling ASL training project, adds its source path to `PYTHONPATH`, and then runs the existing OpenCV + MediaPipe webcam detector that uses the model assets from that project.
 
 ## Example package usage
 
