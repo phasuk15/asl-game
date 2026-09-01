@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Per-participant user-test results (performance_log.csv + raw event JSON)
+/results/

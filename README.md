@@ -58,3 +58,53 @@ manager = GameManager(model_adapter=model)
 manager.run_tutorial()
 manager.start_wordle_session()
 ```
+
+## Recording performance during a user test
+
+`StudySession` wraps a `GameManager` with a per-participant performance log
+and a clean reset, so one run of the app can walk through several
+participants in a user-testing session without restarting the process or
+leaking one player's progress into the next.
+
+```python
+from game_mechanics.study_session import StudySession
+
+study = StudySession()  # writes to results/ by default
+manager = study.start_participant("P001")
+
+# ... play the game, logging each scored attempt as it happens ...
+study.record_tutorial_result(word="HELLO", correct=True, response_time_seconds=2.1)
+study.record_wordle_guess(target="LEARN", guess="LEARN", correct=True, response_time_seconds=6.4)
+
+study.reset_for_next_player()  # saves P001's results, clears all state
+manager = study.start_participant("P002")  # fresh tutorial + wordle progress
+```
+
+Each call to `reset_for_next_player()` (or `start_participant()` while a
+session is already active) finalises the outgoing participant and writes:
+
+- `results/performance_log.csv` — one summary row per participant (accuracy,
+  tutorial completion, average response times, wordle outcome, session
+  duration), appended across the whole user-test run.
+- `results/participants/<id>_<timestamp>.json` — that participant's full
+  event log (every tutorial sign and wordle guess with its response time),
+  for deeper analysis later.
+
+`results/` is git-ignored since it holds participant data from local runs.
+
+### In the live webcam overlay
+
+`examples/live_webcam.py` uses `StudySession` directly:
+
+```bash
+python3 -m examples.live_webcam --mode tutorial --participant-id P001
+```
+
+Omit `--participant-id` and you'll be prompted for one at startup (leave it
+blank to auto-generate `P001`, `P002`, ...). While the overlay is running:
+
+- `T` / `W` / `B` switch between tutorial, wordle, and both modes.
+- `N` saves the current player's results, resets the tutorial and wordle
+  state, and prompts in the terminal for the next participant's ID — ready
+  for the next person in the study without restarting the app.
+- `Q` saves the current player's results and quits.

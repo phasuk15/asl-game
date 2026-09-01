@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 
@@ -33,7 +34,7 @@ import numpy as np
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
-from game_mechanics.game_manager import GameManager
+from game_mechanics.study_session import StudySession
 from src.shared.features import FeatureExtractor
 from src.shared.preprocessing import preprocess_frame
 from src.shared.smoothing import LandmarkSmoother, PredictionSmoother
@@ -41,9 +42,12 @@ from src.static.classifier import SignClassifier
 
 
 class GameOverlaySession:
-    def __init__(self, mode: str = "tutorial"):
+    def __init__(self, mode: str = "tutorial", participant_id: str | None = None):
         self.mode = mode
-        self.manager = GameManager()
+        # StudySession owns the per-participant GameManager and performance
+        # log, so results survive resets between players in a user test.
+        self.study = StudySession()
+        self.manager = self.study.start_participant(participant_id)
         self.previous_mode = mode
         self.landmark_smoother = LandmarkSmoother(window_size=5)
         self.prediction_smoother = PredictionSmoother(window_size=7)
@@ -57,6 +61,49 @@ class GameOverlaySession:
         self.current_signal = "UNKNOWN"
         self.current_confidence = 0.0
 
+        # Edge-detection so a held sign is only scored once, plus the
+        # response-time clocks used to log how long each attempt took.
+        self._last_stable_label: str | None = None
+        self._current_lesson_word: str | None = None
+        self._lesson_started_at = time.time()
+        self._wordle_last_action_at = time.time()
+
+        print(f"Started session for participant {self.study.participant_id}.")
+
+    def _sync_lesson_timer(self) -> None:
+        """Reset the response-time clock whenever the active lesson changes."""
+        if self.manager.tutorial.is_complete():
+            return
+        lesson = self.manager.tutorial.current_lesson()
+        if lesson.word != self._current_lesson_word:
+            self._current_lesson_word = lesson.word
+            self._lesson_started_at = time.time()
+
+    def _start_next_participant(self) -> None:
+        """Save the current player's results and reset all game state so
+        the next person in the user test starts from a clean slate."""
+        summary = self.study.reset_for_next_player()
+        if summary:
+            print(
+                f"Saved results for {summary['participant_id']}: "
+                f"{summary['accuracy_percent']}% accuracy, "
+                f"{summary['session_duration_seconds']}s -> {self.study.log_path}"
+            )
+
+        participant_id = input("Next participant ID (blank to auto-generate): ").strip()
+        self.manager = self.study.start_participant(participant_id)
+        self.mode = "tutorial"
+        self.previous_mode = "tutorial"
+        self.wordle = self.manager.start_wordle_session()
+        self.current_signal = "UNKNOWN"
+        self.current_confidence = 0.0
+        self._last_stable_label = None
+        self._current_lesson_word = None
+        self._lesson_started_at = time.time()
+        self._wordle_last_action_at = time.time()
+        self.status_message = f"Ready for participant {self.study.participant_id}."
+        print(f"Started session for participant {self.study.participant_id}.")
+
     def _switch_mode(self, new_mode: str) -> None:
         if new_mode == self.mode:
             return
@@ -64,11 +111,15 @@ class GameOverlaySession:
         self.mode = new_mode
         if self.mode == "tutorial":
             self.status_message = "Tutorial mode activated."
+            self._current_lesson_word = None
         elif self.mode == "wordle":
             self.wordle = self.manager.start_wordle_session()
             self.status_message = "Wordle mode activated."
+            self._wordle_last_action_at = time.time()
         elif self.mode == "both":
             self.status_message = "Tutorial + Wordle mode activated."
+            self._current_lesson_word = None
+            self._wordle_last_action_at = time.time()
 
     def _key_to_mode(self, key: int) -> str | None:
         mapping = {
@@ -107,6 +158,8 @@ class GameOverlaySession:
         if self.mode in {"tutorial", "both"} and not self.manager.tutorial.is_complete():
             lesson = self.manager.tutorial.current_lesson()
             if label == lesson.word:
+                response_time = time.time() - self._lesson_started_at
+                self.study.record_tutorial_result(lesson.word, True, response_time)
                 self.manager.tutorial.mark_completed(lesson)
                 self.status_message = f"Correct! Nice sign for {lesson.word}."
                 next_lesson = self.manager.tutorial.advance()
@@ -116,8 +169,11 @@ class GameOverlaySession:
                     if self.mode == "both":
                         self.mode = "wordle"
                         self.wordle = self.manager.start_wordle_session()
+                        self._wordle_last_action_at = time.time()
                         self.previous_mode = "wordle"
                 else:
+                    self._current_lesson_word = next_lesson.word
+                    self._lesson_started_at = time.time()
                     self.status_message = f"Next: show {next_lesson.word}"
                 return
 
@@ -125,7 +181,11 @@ class GameOverlaySession:
 
         if self.mode in {"wordle", "both"}:
             if self.wordle.validate_guess(label):
+                response_time = time.time() - self._wordle_last_action_at
+                target_word = self.wordle.target_word
                 feedback = self.manager.process_guess(label)
+                self.study.record_wordle_guess(target_word, label, feedback["correct"], response_time)
+                self._wordle_last_action_at = time.time()
                 self.status_message = f"Guess {label}: {feedback['pattern']}"
                 if feedback["correct"]:
                     self.status_message = "You solved the word!"
@@ -169,7 +229,14 @@ class GameOverlaySession:
                     detected_label, confidence = self.classifier.predict(features)
                     stable_label = self.prediction_smoother.update(detected_label)
                     self.current_confidence = confidence
-                    self._handle_prediction(stable_label)
+                    self.current_signal = stable_label.strip().upper() if stable_label else "UNKNOWN"
+
+                    # Only score a transition into a new stable sign, not
+                    # every frame it stays held, so one held sign yields one
+                    # performance-log entry instead of dozens.
+                    if stable_label and stable_label != self._last_stable_label:
+                        self._handle_prediction(stable_label)
+                    self._last_stable_label = stable_label
 
                     for lm in hand_landmarks:
                         x = int(lm.x * frame.shape[1])
@@ -177,7 +244,11 @@ class GameOverlaySession:
                         cv2.circle(frame, (x, y), 3, (0, 255, 0), -1)
                 else:
                     self.current_signal = "UNKNOWN"
+                    self.current_confidence = 0.0
+                    self._last_stable_label = None
                     self.status_message = "No hand detected. Move into frame."
+
+                self._sync_lesson_timer()
 
                 if self.mode in {"tutorial", "both"} and not self.manager.tutorial.is_complete():
                     prompt = self._tutorial_prompt()
@@ -186,17 +257,27 @@ class GameOverlaySession:
                 else:
                     prompt = "Game complete"
 
-                self._draw_text(frame, f"Mode: {self.mode.upper()}", 30)
-                self._draw_text(frame, prompt, 60)
-                self._draw_text(frame, f"Detected: {self.current_signal} ({self.current_confidence:.0%})", 90)
-                self._draw_text(frame, self.status_message, 120, color=(0, 255, 255), scale=0.6)
-                self._draw_text(frame, "Press T/W/B for modes | Q to quit", frame.shape[0] - 20, color=(255, 255, 255), scale=0.6)
+                self._draw_text(frame, f"Participant: {self.study.participant_id}", 30)
+                self._draw_text(frame, f"Mode: {self.mode.upper()}", 60)
+                self._draw_text(frame, prompt, 90)
+                self._draw_text(frame, f"Detected: {self.current_signal} ({self.current_confidence:.0%})", 120)
+                self._draw_text(frame, self.status_message, 150, color=(0, 255, 255), scale=0.6)
+                self._draw_text(
+                    frame,
+                    "Press T/W/B for modes | N for next participant | Q to quit",
+                    frame.shape[0] - 20,
+                    color=(255, 255, 255),
+                    scale=0.6,
+                )
 
                 cv2.imshow("ASL Game Overlay", frame)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
+
+                if key in {ord("n"), ord("N")}:
+                    self._start_next_participant()
 
                 if key in {ord("t"), ord("T"), ord("w"), ord("W"), ord("b"), ord("B")}:
                     next_mode = self._key_to_mode(key)
@@ -205,6 +286,14 @@ class GameOverlaySession:
 
         cap.release()
         cv2.destroyAllWindows()
+
+        summary = self.study.reset_for_next_player()
+        if summary:
+            print(
+                f"Saved results for {summary['participant_id']}: "
+                f"{summary['accuracy_percent']}% accuracy, "
+                f"{summary['session_duration_seconds']}s -> {self.study.log_path}"
+            )
 
 
 def main() -> None:
@@ -215,9 +304,18 @@ def main() -> None:
         default="tutorial",
         help="Game mode to launch with the webcam overlay.",
     )
+    parser.add_argument(
+        "--participant-id",
+        default=None,
+        help="Identifier for the first participant. Prompted for if omitted.",
+    )
     args = parser.parse_args()
 
-    GameOverlaySession(mode=args.mode).run()
+    participant_id = args.participant_id
+    if participant_id is None:
+        participant_id = input("Participant ID (blank to auto-generate): ").strip()
+
+    GameOverlaySession(mode=args.mode, participant_id=participant_id).run()
 
 
 if __name__ == "__main__":
