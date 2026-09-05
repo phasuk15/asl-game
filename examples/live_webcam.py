@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 
@@ -41,9 +42,17 @@ import numpy as np
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
+# asl-training's own top-level config module (training_root is now on
+# sys.path). Reused for the dynamic-pipeline constants (sequence length,
+# minimum frames, confidence threshold, asset paths) so this project can't
+# silently drift from whatever that project was trained with.
+import config as training_config
+
 from game_mechanics.study_session import StudySession
-from src.shared.features import FeatureExtractor
+from src.dynamic.classifier import DynamicSignClassifier
+from src.shared.features import FeatureExtractor, extract_body_features
 from src.shared.preprocessing import preprocess_frame
+from src.shared.sequence import flatten_sequence, resample_sequence
 from src.shared.smoothing import LandmarkSmoother, PredictionSmoother
 from src.static.classifier import SignClassifier
 
@@ -69,6 +78,23 @@ class GameOverlaySession:
         model_path = training_root / "src" / "static" / "models" / "sign_model.pkl"
         self.classifier = SignClassifier(model_path=str(model_path))
 
+        # The rally game scores whole motion trajectories, not single
+        # frames, so it needs the separate dynamic (word-level) model. It's
+        # optional: if it hasn't been trained/copied yet, rally mode is
+        # simply left off the start screen rather than crashing the app.
+        dynamic_model_path = training_root / "src" / "dynamic" / "models" / "sign_model.pkl"
+        try:
+            self.dynamic_classifier = DynamicSignClassifier(
+                model_path=str(dynamic_model_path),
+                models_dir=str(dynamic_model_path.parent),
+            )
+        except FileNotFoundError:
+            self.dynamic_classifier = None
+            print(
+                f"[live_webcam] No dynamic sign model found at {dynamic_model_path} "
+                "- Rally mode will be unavailable."
+            )
+
         self.wordle = self.manager.start_wordle_session()
         self.status_message = "Waiting for hand detection..."
         self.current_signal = "UNKNOWN"
@@ -81,9 +107,17 @@ class GameOverlaySession:
         self._lesson_started_at = time.time()
         self._wordle_last_action_at = time.time()
 
+        # Rally mode buffers per-frame body+hand features while a sign is
+        # being performed, and classifies the whole clip once the hand
+        # (and body) drop out of frame - see _finish_rally_buffer().
+        self._rally_buffer: list = []
+        self._rally_was_visible = False
+
         print(f"Started session for participant {self.study.participant_id}.")
 
-        if mode:
+        if mode == "rally" and self.dynamic_classifier is None:
+            print("[live_webcam] --mode rally requested but no dynamic model is available; showing the start screen instead.")
+        elif mode:
             self._start_playing(mode)
 
     def _sync_lesson_timer(self) -> None:
@@ -117,6 +151,8 @@ class GameOverlaySession:
         self._current_lesson_word = None
         self._lesson_started_at = time.time()
         self._wordle_last_action_at = time.time()
+        self._rally_buffer = []
+        self._rally_was_visible = False
         self.status_message = f"Ready for participant {self.study.participant_id}."
         print(f"Started session for participant {self.study.participant_id}.")
 
@@ -131,6 +167,8 @@ class GameOverlaySession:
         self._draw_text(frame, "Press T - Tutorial (learn the signs)", 115)
         self._draw_text(frame, "Press G - Games (Wordle)", 145)
         self._draw_text(frame, "Press B - Tutorial, then Games", 175)
+        if self.dynamic_classifier is not None:
+            self._draw_text(frame, "Press R - Timed Rally (dynamic signs)", 205)
         self._draw_text(
             frame,
             "Press N for next participant | Q to quit",
@@ -140,7 +178,10 @@ class GameOverlaySession:
         )
 
     def _switch_mode(self, new_mode: str) -> None:
-        if new_mode == self.mode:
+        # Rally is exempt from the no-op guard: pressing R again - whether
+        # mid-round or after one finishes - deliberately starts a fresh
+        # round rather than doing nothing.
+        if new_mode == self.mode and new_mode != "rally":
             return
 
         self.mode = new_mode
@@ -155,6 +196,11 @@ class GameOverlaySession:
             self.status_message = "Tutorial + Wordle mode activated."
             self._current_lesson_word = None
             self._wordle_last_action_at = time.time()
+        elif self.mode == "rally":
+            rally = self.manager.start_rally_session()
+            self._rally_buffer = []
+            self._rally_was_visible = False
+            self.status_message = f"Rally! Sign: {rally.current_prompt}"
 
     def _key_to_mode(self, key: int) -> str | None:
         mapping = {
@@ -162,12 +208,17 @@ class GameOverlaySession:
             ord("w"): "wordle",
             ord("g"): "wordle",
             ord("b"): "both",
+            ord("r"): "rally",
             ord("T"): "tutorial",
             ord("W"): "wordle",
             ord("G"): "wordle",
             ord("B"): "both",
+            ord("R"): "rally",
         }
-        return mapping.get(key)
+        mode = mapping.get(key)
+        if mode == "rally" and self.dynamic_classifier is None:
+            return None
+        return mode
 
     def _tutorial_prompt(self) -> str:
         lesson = self.manager.tutorial.current_lesson()
@@ -175,6 +226,16 @@ class GameOverlaySession:
 
     def _wordle_prompt(self) -> str:
         return f"Wordle target: {self.wordle.target_word}"
+
+    def _rally_prompt(self) -> str:
+        rally = self.manager.rally
+        if rally is None or rally.current_prompt is None:
+            return "Rally: press R to start"
+        return (
+            f"Rally: sign {rally.current_prompt} | "
+            f"streak {rally.streak} (best {rally.best_streak}) | "
+            f"{rally.time_remaining():.0f}s left"
+        )
 
     def _draw_text(self, frame, text: str, y: int, color=(255, 255, 255), scale=0.7):
         cv2.putText(
@@ -207,7 +268,6 @@ class GameOverlaySession:
                         self.mode = "wordle"
                         self.wordle = self.manager.start_wordle_session()
                         self._wordle_last_action_at = time.time()
-                        self.previous_mode = "wordle"
                 else:
                     self._current_lesson_word = next_lesson.word
                     self._lesson_started_at = time.time()
@@ -230,6 +290,44 @@ class GameOverlaySession:
             else:
                 self.status_message = f"Wordle: {self.wordle.target_word} (invalid guess: {label})"
 
+    def _finish_rally_buffer(self) -> None:
+        """Falling edge: hand+body just disappeared, so the buffered clip
+        is a completed sign - classify it as one trajectory and score it
+        against the current rally prompt."""
+        buffer, self._rally_buffer = self._rally_buffer, []
+        if len(buffer) < training_config.MIN_SEQUENCE_FRAMES or self.dynamic_classifier is None:
+            return
+
+        sequence = resample_sequence(np.stack(buffer), training_config.SEQUENCE_LENGTH)
+        label, confidence = self.dynamic_classifier.predict(flatten_sequence(sequence))
+        submitted = label.strip().upper() if confidence >= training_config.MIN_DYNAMIC_PREDICTION_CONFIDENCE else ""
+
+        result = self.manager.process_rally_sign(submitted)
+        self._apply_rally_result(result, detected_label=label)
+
+    def _apply_rally_result(self, result: dict, detected_label: str = "") -> None:
+        self.study.record_rally_attempt(
+            target=result["prompt"],
+            submitted=result["submitted"],
+            correct=result["correct"],
+            response_time_seconds=result["response_time_seconds"],
+        )
+
+        if result["timed_out"]:
+            self.status_message = f"Too slow for {result['prompt']}! Streak reset."
+        elif result["correct"]:
+            self.status_message = f"Nice! {result['prompt']} correct - streak {result['streak']}."
+        else:
+            seen = detected_label.strip().upper() or "an unclear sign"
+            self.status_message = f"Not quite - target was {result['prompt']} (saw {seen})."
+
+        if result["finished"]:
+            accuracy = self.manager.rally.summary()["accuracy_percent"]
+            self.status_message = (
+                f"Rally over ({result['finish_reason']})! Best streak {result['best_streak']}, "
+                f"{accuracy}% accuracy. Press R to go again."
+            )
+
     def run(self) -> None:
         if self.screen == "playing":
             print(f"Launching ASL game overlay in {self.mode} mode")
@@ -248,7 +346,25 @@ class GameOverlaySession:
 
         cap = cv2.VideoCapture(0)
 
-        with vision.HandLandmarker.create_from_options(hand_options) as landmarker:
+        with ExitStack() as stack:
+            landmarker = stack.enter_context(vision.HandLandmarker.create_from_options(hand_options))
+
+            # Rally needs a pose landmarker too (motion trajectories are
+            # scored from hand + upper-body movement together). Only set
+            # one up when a dynamic model was actually found - no point
+            # paying for pose detection every frame otherwise.
+            pose_landmarker = None
+            if self.dynamic_classifier is not None:
+                pose_options = vision.PoseLandmarkerOptions(
+                    base_options=mp_python.BaseOptions(
+                        model_asset_path=str(training_root / "assets" / "pose_landmarker_lite.task")
+                    ),
+                    num_poses=1,
+                    min_pose_detection_confidence=training_config.MIN_POSE_DETECTION_CONFIDENCE,
+                    min_tracking_confidence=training_config.MIN_POSE_TRACKING_CONFIDENCE,
+                )
+                pose_landmarker = stack.enter_context(vision.PoseLandmarker.create_from_options(pose_options))
+
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
@@ -273,10 +389,15 @@ class GameOverlaySession:
 
                     # Only score a transition into a new stable sign, not
                     # every frame it stays held, so one held sign yields one
-                    # performance-log entry instead of dozens. The start
-                    # screen ignores predictions entirely - nothing is
-                    # scored until a mode has been chosen.
-                    if self.screen == "playing" and stable_label and stable_label != self._last_stable_label:
+                    # performance-log entry instead of dozens. Rally uses
+                    # its own hand+pose buffering below, not this
+                    # single-frame classifier, so it's skipped there.
+                    if (
+                        self.screen == "playing"
+                        and self.mode != "rally"
+                        and stable_label
+                        and stable_label != self._last_stable_label
+                    ):
                         self._handle_prediction(stable_label)
                     self._last_stable_label = stable_label
 
@@ -284,33 +405,68 @@ class GameOverlaySession:
                         x = int(lm.x * frame.shape[1])
                         y = int(lm.y * frame.shape[0])
                         cv2.circle(frame, (x, y), 3, (0, 255, 0), -1)
+
+                    if self.screen == "playing" and self.mode == "rally" and pose_landmarker is not None:
+                        pose_results = pose_landmarker.detect(mp_image)
+                        if pose_results.pose_landmarks:
+                            pose_arr = np.array(
+                                [[lm.x, lm.y, lm.z] for lm in pose_results.pose_landmarks[0]]
+                            )
+                            self._rally_buffer.append(extract_body_features(raw, pose_arr, dominant_side="right"))
+                            self._rally_was_visible = True
+                        elif self._rally_was_visible:
+                            self._finish_rally_buffer()
+                            self._rally_was_visible = False
                 else:
                     self.current_signal = "UNKNOWN"
                     self.current_confidence = 0.0
                     self._last_stable_label = None
                     if self.screen == "playing":
-                        self.status_message = "No hand detected. Move into frame."
+                        if self.mode == "rally":
+                            if self._rally_was_visible:
+                                self._finish_rally_buffer()
+                                self._rally_was_visible = False
+                        else:
+                            self.status_message = "No hand detected. Move into frame."
+
+                if self.screen == "playing" and self.mode == "rally":
+                    timeout_result = self.manager.check_rally_timeout()
+                    if timeout_result is not None:
+                        self._rally_buffer = []
+                        self._rally_was_visible = False
+                        self._apply_rally_result(timeout_result)
 
                 if self.screen == "start":
                     self._draw_start_screen(frame)
                 else:
                     self._sync_lesson_timer()
 
-                    if self.mode in {"tutorial", "both"} and not self.manager.tutorial.is_complete():
+                    if self.mode == "rally":
+                        prompt = self._rally_prompt()
+                    elif self.mode in {"tutorial", "both"} and not self.manager.tutorial.is_complete():
                         prompt = self._tutorial_prompt()
                     elif self.mode in {"wordle", "both"} and self.manager.tutorial.is_complete():
                         prompt = self._wordle_prompt()
                     else:
                         prompt = "Game complete"
 
+                    if self.mode == "rally":
+                        detected_line = (
+                            f"Buffering: {len(self._rally_buffer)} frames"
+                            if self._rally_was_visible
+                            else "Show your hand + upper body to sign"
+                        )
+                    else:
+                        detected_line = f"Detected: {self.current_signal} ({self.current_confidence:.0%})"
+
                     self._draw_text(frame, f"Participant: {self.study.participant_id}", 30)
                     self._draw_text(frame, f"Mode: {self.mode.upper()}", 60)
                     self._draw_text(frame, prompt, 90)
-                    self._draw_text(frame, f"Detected: {self.current_signal} ({self.current_confidence:.0%})", 120)
+                    self._draw_text(frame, detected_line, 120)
                     self._draw_text(frame, self.status_message, 150, color=(0, 255, 255), scale=0.6)
                     self._draw_text(
                         frame,
-                        "Press T/W/B for modes | N for next participant | Q to quit",
+                        "Press T/W/G/B/R for modes | N for next participant | Q to quit",
                         frame.shape[0] - 20,
                         color=(255, 255, 255),
                         scale=0.6,
@@ -326,14 +482,11 @@ class GameOverlaySession:
                     self._start_next_participant()
                     continue
 
-                if self.screen == "start":
-                    if key in {ord("t"), ord("T"), ord("w"), ord("W"), ord("g"), ord("G"), ord("b"), ord("B")}:
-                        next_mode = self._key_to_mode(key)
-                        if next_mode:
-                            self._start_playing(next_mode)
-                elif key in {ord("t"), ord("T"), ord("w"), ord("W"), ord("g"), ord("G"), ord("b"), ord("B")}:
-                    next_mode = self._key_to_mode(key)
-                    if next_mode:
+                next_mode = self._key_to_mode(key)
+                if next_mode:
+                    if self.screen == "start":
+                        self._start_playing(next_mode)
+                    else:
                         self._switch_mode(next_mode)
 
         cap.release()
@@ -352,7 +505,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Launch the ASL game with a live webcam overlay.")
     parser.add_argument(
         "--mode",
-        choices=["tutorial", "wordle", "both"],
+        choices=["tutorial", "wordle", "both", "rally"],
         default=None,
         help="Skip the start screen and launch directly in this mode.",
     )

@@ -85,6 +85,18 @@ class StudySession:
             return
         self.recorder.log_event("wordle", target, guess, correct, response_time_seconds)
 
+    def record_rally_attempt(
+        self,
+        target: str,
+        submitted: str,
+        correct: bool,
+        response_time_seconds: float,
+    ) -> None:
+        """Log a scored Timed Rally / Streak Mode attempt."""
+        if not self.is_active:
+            return
+        self.recorder.log_event("rally", target, submitted, correct, response_time_seconds)
+
     def end_participant(self) -> dict | None:
         """Finalise and persist the active participant's results.
 

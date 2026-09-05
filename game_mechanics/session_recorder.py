@@ -20,6 +20,10 @@ SUMMARY_FIELDS = [
     "wordle_correct_guesses",
     "wordle_won",
     "wordle_avg_response_time_seconds",
+    "rally_attempts",
+    "rally_correct_attempts",
+    "rally_best_streak",
+    "rally_avg_response_time_seconds",
     "total_correct",
     "total_attempts",
     "accuracy_percent",
@@ -96,6 +100,8 @@ def build_summary(recorder: SessionRecorder, manager) -> dict:
     """Combine a recorder's raw events with the manager's final state into one row."""
     tutorial_events = recorder.events_for("tutorial")
     wordle_events = recorder.events_for("wordle")
+    rally_events = recorder.events_for("rally")
+    rally = getattr(manager, "rally", None)
 
     total_attempts = manager.progress.total_attempts
     total_correct = manager.progress.total_correct
@@ -116,6 +122,10 @@ def build_summary(recorder: SessionRecorder, manager) -> dict:
         "wordle_correct_guesses": sum(1 for event in wordle_events if event.correct),
         "wordle_won": manager.wordle.is_won(),
         "wordle_avg_response_time_seconds": _average_response_time(wordle_events),
+        "rally_attempts": len(rally_events),
+        "rally_correct_attempts": sum(1 for event in rally_events if event.correct),
+        "rally_best_streak": rally.best_streak if rally else 0,
+        "rally_avg_response_time_seconds": _average_response_time(rally_events),
         "total_correct": total_correct,
         "total_attempts": total_attempts,
         "accuracy_percent": accuracy_percent,

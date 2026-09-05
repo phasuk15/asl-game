@@ -73,3 +73,31 @@ def test_end_participant_without_an_active_session_returns_none(tmp_path):
 
     assert study.end_participant() is None
     assert study.reset_for_next_player() is None
+
+
+def test_rally_attempts_are_logged_and_summarised(tmp_path):
+    study = StudySession(results_dir=tmp_path)
+
+    manager = study.start_participant("P001")
+    prompt = manager.start_rally_session(words=["EAT", "DRINK"], round_seconds=60.0, prompt_timeout_seconds=4.0).current_prompt
+
+    correct_result = manager.process_rally_sign(prompt)
+    study.record_rally_attempt(
+        target=correct_result["prompt"],
+        submitted=correct_result["submitted"],
+        correct=correct_result["correct"],
+        response_time_seconds=correct_result["response_time_seconds"],
+    )
+    wrong_result = manager.process_rally_sign("NOT-THE-PROMPT")
+    study.record_rally_attempt(
+        target=wrong_result["prompt"],
+        submitted=wrong_result["submitted"],
+        correct=wrong_result["correct"],
+        response_time_seconds=wrong_result["response_time_seconds"],
+    )
+
+    summary = study.reset_for_next_player()
+
+    assert summary["rally_attempts"] == 2
+    assert summary["rally_correct_attempts"] == 1
+    assert summary["rally_best_streak"] == 1

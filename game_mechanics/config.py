@@ -38,3 +38,38 @@ WORDLE_ALLOWED_WORDS = [
     "BASIC",
     "ALPHA",
 ]
+
+# Timed Rally / Streak mode prompts. These are motion-trajectory (word-level)
+# signs, not static handshapes, so they must match the classes the *dynamic*
+# model was trained on - see
+# asl-training/src/dynamic/models/sign_model_meta.json.
+DYNAMIC_SIGN_WORDS = [
+    "COME",
+    "DRINK",
+    "EAT",
+    "FATHER",
+    "GO",
+    "HELP",
+    "KNOW",
+    "LOVE",
+    "MORE",
+    "MOTHER",
+    "PLEASE",
+    "SORRY",
+    "THINK",
+    "WANT",
+    "WATER",
+]
+
+DEFAULT_DYNAMIC_MODEL_CANDIDATES = [
+    TRAINING_PROJECT_ROOT / "src" / "dynamic" / "models" / "sign_model.pkl",
+    TRAINING_PROJECT_ROOT / "src" / "dynamic" / "models" / "best_model.pkl",
+]
+
+# Timed Rally / Streak mode pacing: a round lasts RALLY_ROUND_SECONDS in
+# total; each individual prompt must be signed within
+# RALLY_PROMPT_TIMEOUT_SECONDS or it's scored as a miss and the round moves
+# straight on to the next prompt, so a round keeps producing data even
+# through a bad streak instead of stopping at the first mistake.
+RALLY_ROUND_SECONDS = 60.0
+RALLY_PROMPT_TIMEOUT_SECONDS = 4.0

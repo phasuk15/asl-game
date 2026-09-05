@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import List
 
 from .model_adapter import ModelAdapter
+from .rally import RallyGame
 from .tutorial import TutorialPhase
 from .wordle import WordleGame
 
@@ -28,6 +29,7 @@ class GameManager:
         self.tutorial = TutorialPhase()
         self.progress = PlayerProgress()
         self.wordle = WordleGame()
+        self.rally: RallyGame | None = None
 
     def run_tutorial(self) -> TutorialPhase:
         """Run the tutorial loop until all lessons are complete."""
@@ -66,6 +68,33 @@ class GameManager:
             "won": self.wordle.is_won(),
             "lost": self.wordle.is_lost(),
         }
+
+    def start_rally_session(self, **rally_kwargs) -> RallyGame:
+        """Begin a fresh Timed Rally / Streak Mode round."""
+        self.rally = RallyGame(**rally_kwargs)
+        self.rally.start()
+        return self.rally
+
+    def process_rally_sign(self, label: str) -> dict:
+        """Score a detected dynamic sign against the active rally round."""
+        if self.rally is None:
+            raise ValueError("Call start_rally_session() before scoring rally signs.")
+        result = self.rally.submit(label)
+        self.progress.total_attempts += 1
+        if result["correct"]:
+            self.progress.total_correct += 1
+        return result
+
+    def check_rally_timeout(self) -> dict | None:
+        """Call every tick while rally mode is active; registers a miss if
+        the current prompt's own timer has expired. Returns None otherwise
+        (including when no rally round is active)."""
+        if self.rally is None:
+            return None
+        result = self.rally.check_timeout()
+        if result is not None:
+            self.progress.total_attempts += 1
+        return result
 
     def evaluate_sign(self, features) -> dict:
         prediction = self.model_adapter.predict(features)

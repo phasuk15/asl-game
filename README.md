@@ -1,12 +1,12 @@
 # ASL Game Mechanics
 
-This repository is the gameplay layer for an ASL learning system. It contains the mechanics for a tutorial phase and multiple game modes, including a Wordle-style game, while integrating with the trained models produced in the `asl-training` project.
+This repository is the gameplay layer for an ASL learning system. It contains the mechanics for a tutorial phase and multiple game modes — a Wordle-style guessing game and a Timed Rally / Streak mode — while integrating with the trained models produced in the `asl-training` project.
 
 ## Project purpose
 
 - Teach basic ASL gestures in a guided tutorial
 - Convert live model predictions into game input
-- Support multiple game loops such as Wordle-style guessing
+- Support multiple game loops: Wordle-style guessing (static handshapes) and Timed Rally / Streak mode (dynamic, motion-trajectory signs)
 - Keep model integration isolated so the training project remains responsible for model creation
 
 ## Folder structure
@@ -59,6 +59,50 @@ manager.run_tutorial()
 manager.start_wordle_session()
 ```
 
+## Timed Rally / Streak mode
+
+`RallyGame` ([game_mechanics/rally.py](game_mechanics/rally.py)) is a rapid-fire
+mode built around *dynamic* signs — motion trajectories (e.g. "COME", "DRINK",
+"WANT") rather than static handshapes — scored by the sibling
+`asl-training` project's dynamic (word-level) model instead of the static one
+used by the tutorial and Wordle.
+
+A round has a fixed time budget (`round_seconds`, default 60s). Each prompt
+must be signed within its own short timeout (`prompt_timeout_seconds`,
+default 4s) or it's scored as a miss and the round moves straight to the next
+prompt — a wrong or missed sign resets the streak but does **not** end the
+round, so a single round produces a dense stream of per-attempt
+response-time + accuracy data (the design goal: lots of samples per session)
+rather than stopping at the first mistake. Pass `max_misses` if you want a
+"lives" variant that ends the round early instead.
+
+```python
+from game_mechanics.game_manager import GameManager
+
+manager = GameManager()
+rally = manager.start_rally_session(round_seconds=60.0, prompt_timeout_seconds=4.0)
+print(rally.current_prompt)  # e.g. "DRINK"
+
+result = manager.process_rally_sign("DRINK")  # score a detected sign
+# result: {"correct": True, "streak": 1, "best_streak": 1, "next_prompt": ..., ...}
+
+# Call every tick (e.g. once per video frame) so an unanswered prompt is
+# scored as a miss once its own timeout elapses:
+manager.check_rally_timeout()
+```
+
+Every `process_rally_sign` / `check_rally_timeout` call feeds
+`GameManager.progress` the same way tutorial and Wordle attempts do, and
+`StudySession.record_rally_attempt(...)` logs each one into the same
+per-participant performance log described below (phase `"rally"`), with
+`rally_attempts`, `rally_correct_attempts`, `rally_best_streak`, and
+`rally_avg_response_time_seconds` rolled into the CSV summary row.
+
+The word list (`DYNAMIC_SIGN_WORDS` in
+[game_mechanics/config.py](game_mechanics/config.py)) must match the classes
+the dynamic model was actually trained on — see
+`asl-training/src/dynamic/models/sign_model_meta.json`.
+
 ## Recording performance during a user test
 
 `StudySession` wraps a `GameManager` with a per-participant performance log
@@ -101,10 +145,23 @@ python3 -m examples.live_webcam --mode tutorial --participant-id P001
 ```
 
 Omit `--participant-id` and you'll be prompted for one at startup (leave it
-blank to auto-generate `P001`, `P002`, ...). While the overlay is running:
+blank to auto-generate `P001`, `P002`, ...). Each participant's session opens
+on a start screen — nothing is scored until a mode is chosen, so time spent
+reading the menu never counts toward response times:
 
-- `T` / `W` / `B` switch between tutorial, wordle, and both modes.
-- `N` saves the current player's results, resets the tutorial and wordle
-  state, and prompts in the terminal for the next participant's ID — ready
-  for the next person in the study without restarting the app.
+- `T` — Tutorial. `G` (or `W`) — Games (Wordle). `B` — Tutorial, then Games.
+- `R` — Timed Rally / Streak mode, only offered when a dynamic sign model is
+  found at `asl-training/src/dynamic/models/sign_model.pkl`. Unlike the other
+  modes, pressing `R` again always starts a fresh round, whether the
+  previous one is still running or has finished.
+- Once playing, `T` / `G` / `B` / `R` switch modes directly, same as the
+  start screen.
+- `N` saves the current player's results, resets all game state, prompts in
+  the terminal for the next participant's ID, and returns to the start
+  screen — ready for the next person in the study without restarting the app.
 - `Q` saves the current player's results and quits.
+
+Pass `--mode` on the command line to skip the start screen entirely and
+launch straight into a mode (useful for scripted or non-interactive runs).
+`--mode rally` falls back to the start screen with a warning if no dynamic
+model is available.
