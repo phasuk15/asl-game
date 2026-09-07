@@ -699,6 +699,15 @@ class GameOverlaySession:
                     smoothed = self.landmark_smoother.smooth(raw)
                     features = self.feature_extractor.extract(smoothed)
                     detected_label, confidence = self.classifier.predict(features)
+                    # PredictionSmoother is a blind majority vote over labels
+                    # - it has no idea what confidence produced them - so a
+                    # run of confident wrong guesses and a run of noisy
+                    # low-confidence ones would count equally. Below the
+                    # trained threshold, feed it "no reading" instead of the
+                    # label, the same way the dynamic pipeline already
+                    # discards low-confidence classifications.
+                    if confidence < training_config.MIN_PREDICTION_CONFIDENCE:
+                        detected_label = ""
                     stable_label = self.prediction_smoother.update(detected_label)
                     self.current_confidence = confidence
                     self.current_signal = stable_label.strip().upper() if stable_label else "UNKNOWN"
