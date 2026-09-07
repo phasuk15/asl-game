@@ -20,7 +20,8 @@ class StudySession:
 
         study = StudySession()
         manager = study.start_participant("P001")
-        ... play the game, calling study.record_tutorial_result(...) and
+        ... play the game, calling study.record_tutorial_result(...),
+            study.record_fingerspelling_result(...), and
             study.record_wordle_guess(...) as the player interacts ...
         study.reset_for_next_player()  # saves P001's results, clears state
         manager = study.start_participant("P002")  # fresh run, no carry-over
@@ -72,6 +73,12 @@ class StudySession:
         if not self.is_active:
             return
         self.recorder.log_event("tutorial", word, word if correct else "", correct, response_time_seconds)
+
+    def record_fingerspelling_result(self, letter: str, correct: bool, response_time_seconds: float) -> None:
+        """Log a scored attempt at a fingerspelled letter."""
+        if not self.is_active:
+            return
+        self.recorder.log_event("fingerspelling", letter, letter if correct else "", correct, response_time_seconds)
 
     def record_wordle_guess(
         self,

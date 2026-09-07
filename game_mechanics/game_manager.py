@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List
 
+from .config import FINGERSPELLING_LETTERS
 from .model_adapter import ModelAdapter
 from .rally import RallyGame
 from .tutorial import TutorialPhase
@@ -16,6 +17,7 @@ def _normalise_answer(value: str | None) -> str:
 @dataclass
 class PlayerProgress:
     tutorial_complete: bool = False
+    fingerspelling_complete: bool = False
     unlocked_games: List[str] = field(default_factory=lambda: ["wordle"])
     total_correct: int = 0
     total_attempts: int = 0
@@ -27,6 +29,7 @@ class GameManager:
     def __init__(self, model_adapter: ModelAdapter | None = None):
         self.model_adapter = model_adapter or ModelAdapter()
         self.tutorial = TutorialPhase()
+        self.fingerspelling = TutorialPhase.for_words(FINGERSPELLING_LETTERS)
         self.progress = PlayerProgress()
         self.wordle = WordleGame()
         self.rally: RallyGame | None = None
@@ -43,6 +46,18 @@ class GameManager:
 
         self.progress.tutorial_complete = True
         return self.tutorial
+
+    def run_fingerspelling(self) -> TutorialPhase:
+        """Run the fingerspelling loop until every letter is complete."""
+        while not self.fingerspelling.is_complete():
+            lesson = self.fingerspelling.current_lesson()
+            lesson.completed = True
+            self.progress.total_correct += 1
+            if self.fingerspelling.advance() is None:
+                break
+
+        self.progress.fingerspelling_complete = True
+        return self.fingerspelling
 
     def summarise_tutorial_progress(self) -> dict:
         return {

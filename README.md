@@ -1,10 +1,10 @@
 # ASL Game Mechanics
 
-This repository is the gameplay layer for an ASL learning system. It contains the mechanics for a tutorial phase and multiple game modes — a Wordle-style guessing game and a Timed Rally / Streak mode — while integrating with the trained models produced in the `asl-training` project.
+This repository is the gameplay layer for an ASL learning system. It contains two teaching phases (a dynamic-sign Tutorial and a Fingerspelling alphabet tutorial) and multiple game modes — a Wordle-style guessing game and a Timed Rally / Streak mode — while integrating with the trained models produced in the `asl-training` project.
 
 ## Project purpose
 
-- Teach basic ASL gestures in a guided tutorial
+- Teach basic ASL gestures in two guided tutorials: dynamic (motion-trajectory) signs, and the static fingerspelling alphabet
 - Convert live model predictions into game input
 - Support multiple game loops: Wordle-style guessing (static handshapes) and Timed Rally / Streak mode (dynamic, motion-trajectory signs)
 - Keep model integration isolated so the training project remains responsible for model creation
@@ -25,7 +25,7 @@ The model adapter looks for pickled or joblib-trained models in the standard loc
 
 ## Typical flow
 
-1. Run the tutorial phase to teach the user a small set of ASL signs.
+1. Run the tutorial phase to teach the user a small set of ASL signs, each shown as a looping reference clip before the learner tries it themselves.
 2. Validate each sign using model predictions.
 3. Unlock game modes like Wordle after the tutorial is complete.
 4. Use the same model output to score guesses and evaluate progress.
@@ -58,6 +58,61 @@ manager = GameManager(model_adapter=model)
 manager.run_tutorial()
 manager.start_wordle_session()
 ```
+
+## Tutorial: dynamic signs with a reference demo
+
+The tutorial's vocabulary (`TUTORIAL_WORDS` in
+[game_mechanics/config.py](game_mechanics/config.py)) is the same set of
+dynamic (motion-trajectory) words Rally uses — not because the modes are
+otherwise linked, but because that's the only vocabulary with both a trained
+recogniser (a static handshape model was never trained on these word-level
+signs) *and* real reference footage already on disk
+(`asl-training/datasets/wlasl_subset/<word>/*.mp4`, sourced from WLASL).
+
+In the live webcam overlay, each lesson plays its matching clip on a loop as
+a small picture-in-picture inset while the prompt is active — "watch the
+demo, then try it yourself" — before scoring the learner's own attempt via
+the same buffered dynamic-sign pipeline Rally uses (see below). Not every
+WLASL clip decodes cleanly (some are broken/partial downloads), so
+[examples/live_webcam.py](examples/live_webcam.py) probes each candidate
+clip for a readable frame at startup and picks the first one that actually
+plays, rather than trusting the first file found in the folder.
+
+## Fingerspelling: static signs with a photo demo
+
+The Tutorial above teaches dynamic (motion-trajectory) signs, which need a
+video to demonstrate. A static handshape has no motion, so its tutorial
+(`FINGERSPELLING_LETTERS` in
+[game_mechanics/config.py](game_mechanics/config.py), the alphabet A–Z) uses
+a single reference photo instead — one per letter, sourced from
+`asl-training/datasets/asl_alphabet_train/<LETTER>/*.jpg` (the same dataset
+the static model was trained on) and shown as a still picture-in-picture
+inset ("copy this") rather than a loop.
+
+It's a separate, standalone phase from the dynamic Tutorial - not a
+different mode of the same one - because it's scored by the *static*
+classifier (the same one Wordle uses, since Wordle's static predictions are
+themselves letters) via the same single-frame, edge-triggered pipeline as
+Wordle, rather than the buffered dynamic-sign pipeline Tutorial and Rally
+share. `GameManager.fingerspelling` is a `TutorialPhase` built via
+`TutorialPhase.for_words(FINGERSPELLING_LETTERS)` - the same lesson/advance
+machinery as the dynamic Tutorial, just pointed at a different word list.
+`manager.run_fingerspelling()` mirrors `run_tutorial()` for scripted use.
+
+## Wordle: a real tile-grid board
+
+`WordleGame` now keeps a full `history` of `GuessFeedback` (guess + per-letter
+GREEN/YELLOW/GREY pattern) for the round, not just the raw guessed words -
+[game_mechanics/wordle.py](game_mechanics/wordle.py) - so a UI can redraw the
+whole board without recomputing anything itself.
+
+In the live webcam overlay, `_draw_wordle_board()` renders that history as an
+actual tile grid in the corner of the frame: filled, coloured tiles (matching
+the real Wordle's green/yellow/grey palette) for guesses already made, empty
+outlined tiles for the guesses still to come, sized to the current target
+word's length (4-6 letters depending which `WORDLE_ALLOWED_WORDS` entry is
+active) and `WordleGame.max_guesses` rows. The on-screen prompt no longer
+spells out the target word, since the board is now the actual game surface.
 
 ## Timed Rally / Streak mode
 
@@ -117,7 +172,8 @@ study = StudySession()  # writes to results/ by default
 manager = study.start_participant("P001")
 
 # ... play the game, logging each scored attempt as it happens ...
-study.record_tutorial_result(word="HELLO", correct=True, response_time_seconds=2.1)
+study.record_tutorial_result(word="COME", correct=True, response_time_seconds=2.1)
+study.record_fingerspelling_result(letter="A", correct=True, response_time_seconds=1.4)
 study.record_wordle_guess(target="LEARN", guess="LEARN", correct=True, response_time_seconds=6.4)
 
 study.reset_for_next_player()  # saves P001's results, clears all state
@@ -128,11 +184,12 @@ Each call to `reset_for_next_player()` (or `start_participant()` while a
 session is already active) finalises the outgoing participant and writes:
 
 - `results/performance_log.csv` — one summary row per participant (accuracy,
-  tutorial completion, average response times, wordle outcome, session
-  duration), appended across the whole user-test run.
+  tutorial and fingerspelling completion, average response times, wordle
+  outcome, rally streak, session duration), appended across the whole
+  user-test run.
 - `results/participants/<id>_<timestamp>.json` — that participant's full
-  event log (every tutorial sign and wordle guess with its response time),
-  for deeper analysis later.
+  event log (every tutorial sign, fingerspelled letter, wordle guess, and
+  rally attempt, each with its response time), for deeper analysis later.
 
 `results/` is git-ignored since it holds participant data from local runs.
 
@@ -149,13 +206,16 @@ blank to auto-generate `P001`, `P002`, ...). Each participant's session opens
 on a start screen — nothing is scored until a mode is chosen, so time spent
 reading the menu never counts toward response times:
 
-- `T` — Tutorial. `G` (or `W`) — Games (Wordle). `B` — Tutorial, then Games.
-- `R` — Timed Rally / Streak mode, only offered when a dynamic sign model is
-  found at `asl-training/src/dynamic/models/sign_model.pkl`. Unlike the other
-  modes, pressing `R` again always starts a fresh round, whether the
-  previous one is still running or has finished.
-- Once playing, `T` / `G` / `B` / `R` switch modes directly, same as the
-  start screen.
+- `G` (or `W`) — Games (Wordle). `F` — Fingerspelling. Both always
+  available; both scored by the static handshape model.
+- `T` — Tutorial. `B` — Tutorial, then Games. `R` — Timed Rally / Streak
+  mode. All three need the dynamic sign model
+  (`asl-training/src/dynamic/models/sign_model.pkl`) and are simply left off
+  the start screen (with an explanatory line instead) if it isn't found.
+- Unlike the other modes, pressing `R` again always starts a fresh round,
+  whether the previous one is still running or has finished.
+- Once playing, `T` / `G` / `B` / `R` / `F` switch modes directly, same as
+  the start screen.
 - `N` saves the current player's results, resets all game state, prompts in
   the terminal for the next participant's ID, and returns to the start
   screen — ready for the next person in the study without restarting the app.
@@ -163,5 +223,5 @@ reading the menu never counts toward response times:
 
 Pass `--mode` on the command line to skip the start screen entirely and
 launch straight into a mode (useful for scripted or non-interactive runs).
-`--mode rally` falls back to the start screen with a warning if no dynamic
-model is available.
+`--mode tutorial|both|rally` falls back to the start screen with a warning
+if no dynamic model is available.

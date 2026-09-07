@@ -48,6 +48,7 @@ from mediapipe.tasks.python import vision
 # silently drift from whatever that project was trained with.
 import config as training_config
 
+from game_mechanics.config import DYNAMIC_SIGN_CLIPS_DIR, STATIC_SIGN_IMAGES_DIR
 from game_mechanics.study_session import StudySession
 from src.dynamic.classifier import DynamicSignClassifier
 from src.shared.features import FeatureExtractor, extract_body_features
@@ -58,12 +59,21 @@ from src.static.classifier import SignClassifier
 
 
 class GameOverlaySession:
+    # BGR tile colours matching the real Wordle's palette (green/yellow/grey).
+    _WORDLE_TILE_COLORS = {
+        "GREEN": (106, 170, 100),
+        "YELLOW": (88, 180, 201),
+        "GREY": (126, 124, 120),
+    }
+    _WORDLE_EMPTY_BORDER = (218, 214, 211)
+
     def __init__(self, mode: str | None = None, participant_id: str | None = None):
-        # The session opens on a start screen where the player picks
-        # Tutorial or Games; gameplay logic stays paused until they do, so
-        # idle time spent reading the menu never counts toward response
-        # times. Pass `mode` to skip the menu and launch straight into it
-        # (used by the --mode CLI flag for scripted / non-interactive runs).
+        # The session opens on a start screen where the player picks a mode
+        # (Tutorial, Fingerspelling, Games, Both, or Rally); gameplay logic
+        # stays paused until they do, so idle time spent reading the menu
+        # never counts toward response times. Pass `mode` to skip the menu
+        # and launch straight into it (used by the --mode CLI flag for
+        # scripted / non-interactive runs).
         self.screen = "start"
         self.mode: str | None = None
 
@@ -78,10 +88,14 @@ class GameOverlaySession:
         model_path = training_root / "src" / "static" / "models" / "sign_model.pkl"
         self.classifier = SignClassifier(model_path=str(model_path))
 
-        # The rally game scores whole motion trajectories, not single
-        # frames, so it needs the separate dynamic (word-level) model. It's
-        # optional: if it hasn't been trained/copied yet, rally mode is
-        # simply left off the start screen rather than crashing the app.
+        # Tutorial and Rally both score whole motion trajectories, not
+        # single frames - the tutorial's vocabulary (game_mechanics.config
+        # TUTORIAL_WORDS) is the same word-level sign set Rally uses, and
+        # neither is recognisable by the static handshape model. Loading
+        # the dynamic model is optional: if it hasn't been trained/copied
+        # yet, Tutorial/Both/Rally are simply left off the start screen
+        # (only Wordle, which uses the static model, still works) rather
+        # than crashing the app.
         dynamic_model_path = training_root / "src" / "dynamic" / "models" / "sign_model.pkl"
         try:
             self.dynamic_classifier = DynamicSignClassifier(
@@ -92,7 +106,7 @@ class GameOverlaySession:
             self.dynamic_classifier = None
             print(
                 f"[live_webcam] No dynamic sign model found at {dynamic_model_path} "
-                "- Rally mode will be unavailable."
+                "- Tutorial, Both, and Rally will be unavailable (Games/Wordle still works)."
             )
 
         self.wordle = self.manager.start_wordle_session()
@@ -107,27 +121,195 @@ class GameOverlaySession:
         self._lesson_started_at = time.time()
         self._wordle_last_action_at = time.time()
 
-        # Rally mode buffers per-frame body+hand features while a sign is
-        # being performed, and classifies the whole clip once the hand
-        # (and body) drop out of frame - see _finish_rally_buffer().
-        self._rally_buffer: list = []
-        self._rally_was_visible = False
+        # Tutorial and Rally both buffer per-frame body+hand features while
+        # a sign is being performed, and classify the whole clip once the
+        # hand (and body) drop out of frame - see _finish_dynamic_buffer().
+        self._dynamic_buffer: list = []
+        self._dynamic_was_visible = False
+
+        # Tutorial shows a small looping reference clip of each sign before
+        # asking the player to try it - one real WLASL clip per word, found
+        # once up front rather than re-scanning disk every lesson change.
+        self._demo_clip_paths = self._find_demo_clip_paths()
+        self._demo_cap: cv2.VideoCapture | None = None
+        self._demo_word: str | None = None
+
+        # Fingerspelling is the static-handshape counterpart: a still photo
+        # instead of a looping clip (a static sign has no motion to show),
+        # scored by the same static classifier Wordle uses.
+        self._letter_image_paths = self._find_letter_image_paths()
+        self._current_letter: str | None = None
+        self._letter_started_at = time.time()
+        self._letter_image = None
 
         print(f"Started session for participant {self.study.participant_id}.")
 
-        if mode == "rally" and self.dynamic_classifier is None:
-            print("[live_webcam] --mode rally requested but no dynamic model is available; showing the start screen instead.")
+        if mode in {"tutorial", "both", "rally"} and self.dynamic_classifier is None:
+            print(
+                f"[live_webcam] --mode {mode} requested but no dynamic model is available; "
+                "showing the start screen instead."
+            )
         elif mode:
             self._start_playing(mode)
 
+    def _find_demo_clip_paths(self) -> dict:
+        """Map each tutorial word to one reference clip on disk, if any.
+
+        Several WLASL clips per word fail to decode (broken/partial
+        downloads - in practice the numerically-first file in every
+        folder), so each candidate is actually opened and probed for one
+        readable frame before being picked, rather than trusting the first
+        file found."""
+        paths: dict = {}
+        for lesson in self.manager.tutorial.lessons:
+            if lesson.word in paths:
+                continue
+            clip_dir = DYNAMIC_SIGN_CLIPS_DIR / lesson.word.lower()
+            if not clip_dir.is_dir():
+                continue
+            for clip in sorted(clip_dir.glob("*.mp4")):
+                probe = cv2.VideoCapture(str(clip))
+                readable = probe.isOpened() and probe.read()[0]
+                probe.release()
+                if readable:
+                    paths[lesson.word] = clip
+                    break
+        return paths
+
+    def _open_demo_clip(self, word: str) -> None:
+        """Swap the looping reference-clip capture over to `word`'s clip."""
+        if self._demo_cap is not None:
+            self._demo_cap.release()
+            self._demo_cap = None
+        path = self._demo_clip_paths.get(word)
+        if path is not None:
+            self._demo_cap = cv2.VideoCapture(str(path))
+        self._demo_word = word
+
+    def _draw_tutorial_demo(self, frame) -> None:
+        """Composite a small looping reference clip into the frame's corner."""
+        if self._demo_cap is None:
+            return
+        ret, demo_frame = self._demo_cap.read()
+        if not ret:
+            self._demo_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, demo_frame = self._demo_cap.read()
+            if not ret:
+                return
+
+        inset_w, inset_h = 200, 150
+        demo_frame = cv2.resize(demo_frame, (inset_w, inset_h))
+        x0 = frame.shape[1] - inset_w - 10
+        y0 = 10
+        frame[y0 : y0 + inset_h, x0 : x0 + inset_w] = demo_frame
+        cv2.rectangle(frame, (x0, y0), (x0 + inset_w, y0 + inset_h), (0, 255, 255), 2)
+        cv2.putText(frame, "DEMO", (x0, y0 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
     def _sync_lesson_timer(self) -> None:
-        """Reset the response-time clock whenever the active lesson changes."""
+        """Reset the response-time clock and swap the reference demo clip
+        whenever the active lesson changes."""
         if self.manager.tutorial.is_complete():
             return
         lesson = self.manager.tutorial.current_lesson()
         if lesson.word != self._current_lesson_word:
             self._current_lesson_word = lesson.word
             self._lesson_started_at = time.time()
+            self._open_demo_clip(lesson.word)
+
+    def _find_letter_image_paths(self) -> dict:
+        """Map each fingerspelling letter to one reference photo on disk."""
+        paths: dict = {}
+        for lesson in self.manager.fingerspelling.lessons:
+            letter_dir = STATIC_SIGN_IMAGES_DIR / lesson.word
+            if not letter_dir.is_dir():
+                continue
+            for image_path in sorted(letter_dir.glob("*.jpg")):
+                if cv2.imread(str(image_path)) is not None:
+                    paths[lesson.word] = image_path
+                    break
+        return paths
+
+    def _load_letter_image(self, letter: str) -> None:
+        path = self._letter_image_paths.get(letter)
+        self._letter_image = cv2.imread(str(path)) if path is not None else None
+
+    def _draw_letter_demo(self, frame) -> None:
+        """Composite the current letter's reference photo into the corner."""
+        if self._letter_image is None:
+            return
+        inset_w, inset_h = 200, 150
+        demo_frame = cv2.resize(self._letter_image, (inset_w, inset_h))
+        x0 = frame.shape[1] - inset_w - 10
+        y0 = 10
+        frame[y0 : y0 + inset_h, x0 : x0 + inset_w] = demo_frame
+        cv2.rectangle(frame, (x0, y0), (x0 + inset_w, y0 + inset_h), (0, 255, 255), 2)
+        cv2.putText(frame, "COPY THIS", (x0, y0 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+    def _sync_letter_timer(self) -> None:
+        """Reset the response-time clock and swap the reference photo
+        whenever the active fingerspelling letter changes."""
+        if self.manager.fingerspelling.is_complete():
+            return
+        lesson = self.manager.fingerspelling.current_lesson()
+        if lesson.word != self._current_letter:
+            self._current_letter = lesson.word
+            self._letter_started_at = time.time()
+            self._load_letter_image(lesson.word)
+
+    def _draw_wordle_board(self, frame) -> None:
+        """Draw a tile-grid board like the real Wordle: filled coloured
+        tiles for past guesses (from wordle.history), empty outlined tiles
+        for guesses not yet made."""
+        wordle = self.wordle
+        word_len = len(wordle.target_word)
+        rows = wordle.max_guesses
+        cell, gap, pad, header_h = 38, 6, 14, 34
+
+        board_w = word_len * cell + (word_len - 1) * gap
+        board_h = rows * cell + (rows - 1) * gap
+        panel_w = board_w + pad * 2
+        panel_h = header_h + board_h + pad * 2
+
+        x0 = frame.shape[1] - panel_w - 10
+        y0 = 10
+
+        cv2.rectangle(frame, (x0, y0), (x0 + panel_w, y0 + panel_h), (245, 245, 245), -1)
+        cv2.rectangle(frame, (x0, y0), (x0 + panel_w, y0 + panel_h), (190, 190, 190), 1)
+        cv2.putText(
+            frame,
+            "WORDLE",
+            (x0 + pad, y0 + header_h - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (40, 40, 40),
+            2,
+            cv2.LINE_AA,
+        )
+
+        grid_x, grid_y = x0 + pad, y0 + header_h
+
+        for row in range(rows):
+            feedback = wordle.history[row] if row < len(wordle.history) else None
+            for col in range(word_len):
+                cx = grid_x + col * (cell + gap)
+                cy = grid_y + row * (cell + gap)
+
+                if feedback is not None:
+                    letter = feedback.guess[col]
+                    tile_color = self._WORDLE_TILE_COLORS[feedback.pattern[col]]
+                    cv2.rectangle(frame, (cx, cy), (cx + cell, cy + cell), tile_color, -1)
+                    text_color = (255, 255, 255)
+                else:
+                    letter = ""
+                    cv2.rectangle(frame, (cx, cy), (cx + cell, cy + cell), (255, 255, 255), -1)
+                    cv2.rectangle(frame, (cx, cy), (cx + cell, cy + cell), self._WORDLE_EMPTY_BORDER, 2)
+                    text_color = (40, 40, 40)
+
+                if letter:
+                    (tw, th), _ = cv2.getTextSize(letter, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+                    tx = cx + (cell - tw) // 2
+                    ty = cy + (cell + th) // 2
+                    cv2.putText(frame, letter, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2, cv2.LINE_AA)
 
     def _start_next_participant(self) -> None:
         """Save the current player's results and reset all game state so
@@ -151,8 +333,15 @@ class GameOverlaySession:
         self._current_lesson_word = None
         self._lesson_started_at = time.time()
         self._wordle_last_action_at = time.time()
-        self._rally_buffer = []
-        self._rally_was_visible = False
+        self._dynamic_buffer = []
+        self._dynamic_was_visible = False
+        if self._demo_cap is not None:
+            self._demo_cap.release()
+            self._demo_cap = None
+        self._demo_word = None
+        self._current_letter = None
+        self._letter_started_at = time.time()
+        self._letter_image = None
         self.status_message = f"Ready for participant {self.study.participant_id}."
         print(f"Started session for participant {self.study.participant_id}.")
 
@@ -164,11 +353,20 @@ class GameOverlaySession:
     def _draw_start_screen(self, frame) -> None:
         self._draw_text(frame, f"Participant: {self.study.participant_id}", 40, scale=0.8)
         self._draw_text(frame, "Choose how to continue:", 80, color=(0, 255, 255))
-        self._draw_text(frame, "Press T - Tutorial (learn the signs)", 115)
-        self._draw_text(frame, "Press G - Games (Wordle)", 145)
-        self._draw_text(frame, "Press B - Tutorial, then Games", 175)
+        self._draw_text(frame, "Press G - Games (Wordle)", 115)
+        self._draw_text(frame, "Press F - Fingerspelling (learn the alphabet)", 145)
         if self.dynamic_classifier is not None:
-            self._draw_text(frame, "Press R - Timed Rally (dynamic signs)", 205)
+            self._draw_text(frame, "Press T - Tutorial (learn the signs)", 175)
+            self._draw_text(frame, "Press B - Tutorial, then Games", 205)
+            self._draw_text(frame, "Press R - Timed Rally (dynamic signs)", 235)
+        else:
+            self._draw_text(
+                frame,
+                "Tutorial / Both / Rally unavailable - no dynamic model found",
+                175,
+                color=(0, 0, 255),
+                scale=0.55,
+            )
         self._draw_text(
             frame,
             "Press N for next participant | Q to quit",
@@ -198,9 +396,12 @@ class GameOverlaySession:
             self._wordle_last_action_at = time.time()
         elif self.mode == "rally":
             rally = self.manager.start_rally_session()
-            self._rally_buffer = []
-            self._rally_was_visible = False
+            self._dynamic_buffer = []
+            self._dynamic_was_visible = False
             self.status_message = f"Rally! Sign: {rally.current_prompt}"
+        elif self.mode == "fingerspell":
+            self.status_message = "Fingerspelling mode activated."
+            self._current_letter = None
 
     def _key_to_mode(self, key: int) -> str | None:
         mapping = {
@@ -209,14 +410,18 @@ class GameOverlaySession:
             ord("g"): "wordle",
             ord("b"): "both",
             ord("r"): "rally",
+            ord("f"): "fingerspell",
             ord("T"): "tutorial",
             ord("W"): "wordle",
             ord("G"): "wordle",
             ord("B"): "both",
             ord("R"): "rally",
+            ord("F"): "fingerspell",
         }
         mode = mapping.get(key)
-        if mode == "rally" and self.dynamic_classifier is None:
+        # Tutorial, Both, and Rally all need the dynamic model - none are
+        # offered (on the start screen or mid-play) without it.
+        if mode in {"tutorial", "both", "rally"} and self.dynamic_classifier is None:
             return None
         return mode
 
@@ -225,7 +430,11 @@ class GameOverlaySession:
         return f"Tutorial: show {lesson.word}"
 
     def _wordle_prompt(self) -> str:
-        return f"Wordle target: {self.wordle.target_word}"
+        return f"Wordle: sign a {len(self.wordle.target_word)}-letter word"
+
+    def _fingerspell_prompt(self) -> str:
+        lesson = self.manager.fingerspelling.current_lesson()
+        return f"Fingerspell: show {lesson.word}"
 
     def _rally_prompt(self) -> str:
         rally = self.manager.rally
@@ -249,61 +458,103 @@ class GameOverlaySession:
             cv2.LINE_AA,
         )
 
+    def _draw_hand_skeleton(self, frame, hand_landmarks) -> None:
+        """Draw the hand as a skeleton: bones connecting the joints (via
+        asl-training's own HAND_CONNECTIONS topology), then a dot on top of
+        each joint - not just the loose dots this used to draw."""
+        points = [(int(lm.x * frame.shape[1]), int(lm.y * frame.shape[0])) for lm in hand_landmarks]
+
+        for start, end in training_config.HAND_CONNECTIONS:
+            cv2.line(frame, points[start], points[end], (255, 255, 255), 1, cv2.LINE_AA)
+
+        for point in points:
+            cv2.circle(frame, point, 3, (0, 255, 0), -1)
+
     def _handle_prediction(self, label: str) -> None:
+        """Single-frame static-model path, used for Wordle and
+        Fingerspelling (both static handshapes): dynamic signs (Tutorial,
+        Rally) are scored from buffered clips instead - see
+        _finish_dynamic_buffer()."""
         label = label.strip().upper()
         self.current_signal = label
 
-        if self.mode in {"tutorial", "both"} and not self.manager.tutorial.is_complete():
-            lesson = self.manager.tutorial.current_lesson()
+        if self.mode == "fingerspell" and not self.manager.fingerspelling.is_complete():
+            lesson = self.manager.fingerspelling.current_lesson()
             if label == lesson.word:
-                response_time = time.time() - self._lesson_started_at
-                self.study.record_tutorial_result(lesson.word, True, response_time)
-                self.manager.tutorial.mark_completed(lesson)
+                response_time = time.time() - self._letter_started_at
+                self.study.record_fingerspelling_result(lesson.word, True, response_time)
+                self.manager.fingerspelling.mark_completed(lesson)
                 self.status_message = f"Correct! Nice sign for {lesson.word}."
-                next_lesson = self.manager.tutorial.advance()
+                next_lesson = self.manager.fingerspelling.advance()
                 if next_lesson is None:
-                    self.manager.progress.tutorial_complete = True
-                    self.status_message = "Tutorial complete!"
-                    if self.mode == "both":
-                        self.mode = "wordle"
-                        self.wordle = self.manager.start_wordle_session()
-                        self._wordle_last_action_at = time.time()
+                    self.manager.progress.fingerspelling_complete = True
+                    self.status_message = "Fingerspelling complete!"
                 else:
-                    self._current_lesson_word = next_lesson.word
-                    self._lesson_started_at = time.time()
+                    self._current_letter = next_lesson.word
+                    self._letter_started_at = time.time()
+                    self._load_letter_image(next_lesson.word)
                     self.status_message = f"Next: show {next_lesson.word}"
-                return
-
-            self.status_message = f"Tutorial: show {lesson.word}"
-
-        if self.mode in {"wordle", "both"}:
-            if self.wordle.validate_guess(label):
-                response_time = time.time() - self._wordle_last_action_at
-                target_word = self.wordle.target_word
-                feedback = self.manager.process_guess(label)
-                self.study.record_wordle_guess(target_word, label, feedback["correct"], response_time)
-                self._wordle_last_action_at = time.time()
-                self.status_message = f"Guess {label}: {feedback['pattern']}"
-                if feedback["correct"]:
-                    self.status_message = "You solved the word!"
-                    self.wordle = self.manager.start_wordle_session()
             else:
-                self.status_message = f"Wordle: {self.wordle.target_word} (invalid guess: {label})"
+                self.status_message = f"Fingerspell: show {lesson.word} (saw {label})"
+            return
 
-    def _finish_rally_buffer(self) -> None:
+        if self.wordle.validate_guess(label):
+            response_time = time.time() - self._wordle_last_action_at
+            target_word = self.wordle.target_word
+            feedback = self.manager.process_guess(label)
+            self.study.record_wordle_guess(target_word, label, feedback["correct"], response_time)
+            self._wordle_last_action_at = time.time()
+            self.status_message = f"Guess {label}: {feedback['pattern']}"
+            if feedback["correct"]:
+                self.status_message = "You solved the word!"
+                self.wordle = self.manager.start_wordle_session()
+        else:
+            self.status_message = f"Wordle: {self.wordle.target_word} (invalid guess: {label})"
+
+    def _handle_tutorial_dynamic_sign(self, detected: str, raw_label: str) -> None:
+        """Score one classified dynamic-sign clip against the current
+        tutorial lesson (mirrors the old per-frame tutorial branch, but
+        driven by a whole buffered trajectory instead of a single frame)."""
+        lesson = self.manager.tutorial.current_lesson()
+        if detected and detected == lesson.word:
+            response_time = time.time() - self._lesson_started_at
+            self.study.record_tutorial_result(lesson.word, True, response_time)
+            self.manager.tutorial.mark_completed(lesson)
+            self.status_message = f"Correct! Nice sign for {lesson.word}."
+            next_lesson = self.manager.tutorial.advance()
+            if next_lesson is None:
+                self.manager.progress.tutorial_complete = True
+                self.status_message = "Tutorial complete!"
+                if self.mode == "both":
+                    self.mode = "wordle"
+                    self.wordle = self.manager.start_wordle_session()
+                    self._wordle_last_action_at = time.time()
+            else:
+                self._current_lesson_word = next_lesson.word
+                self._lesson_started_at = time.time()
+                self._open_demo_clip(next_lesson.word)
+                self.status_message = f"Next: show {next_lesson.word}"
+        else:
+            seen = raw_label.strip().upper() or "an unclear sign"
+            self.status_message = f"Not quite - target is {lesson.word} (saw {seen}). Try again."
+
+    def _finish_dynamic_buffer(self) -> None:
         """Falling edge: hand+body just disappeared, so the buffered clip
-        is a completed sign - classify it as one trajectory and score it
-        against the current rally prompt."""
-        buffer, self._rally_buffer = self._rally_buffer, []
+        is a completed sign - classify it as one trajectory and route the
+        result to whichever dynamic-sign mode is active."""
+        buffer, self._dynamic_buffer = self._dynamic_buffer, []
         if len(buffer) < training_config.MIN_SEQUENCE_FRAMES or self.dynamic_classifier is None:
             return
 
         sequence = resample_sequence(np.stack(buffer), training_config.SEQUENCE_LENGTH)
         label, confidence = self.dynamic_classifier.predict(flatten_sequence(sequence))
-        submitted = label.strip().upper() if confidence >= training_config.MIN_DYNAMIC_PREDICTION_CONFIDENCE else ""
+        detected = label.strip().upper() if confidence >= training_config.MIN_DYNAMIC_PREDICTION_CONFIDENCE else ""
 
-        result = self.manager.process_rally_sign(submitted)
-        self._apply_rally_result(result, detected_label=label)
+        if self.mode == "rally":
+            result = self.manager.process_rally_sign(detected)
+            self._apply_rally_result(result, detected_label=label)
+        elif self.mode in {"tutorial", "both"} and not self.manager.tutorial.is_complete():
+            self._handle_tutorial_dynamic_sign(detected, raw_label=label)
 
     def _apply_rally_result(self, result: dict, detected_label: str = "") -> None:
         self.study.record_rally_attempt(
@@ -332,7 +583,7 @@ class GameOverlaySession:
         if self.screen == "playing":
             print(f"Launching ASL game overlay in {self.mode} mode")
         else:
-            print("Launching ASL game overlay. Choose Tutorial or Games from the start screen.")
+            print("Launching ASL game overlay. Choose a mode from the start screen.")
         print(f"Using model: {training_root / 'src' / 'static' / 'models' / 'sign_model.pkl'}")
 
         hand_options = vision.HandLandmarkerOptions(
@@ -349,10 +600,11 @@ class GameOverlaySession:
         with ExitStack() as stack:
             landmarker = stack.enter_context(vision.HandLandmarker.create_from_options(hand_options))
 
-            # Rally needs a pose landmarker too (motion trajectories are
-            # scored from hand + upper-body movement together). Only set
-            # one up when a dynamic model was actually found - no point
-            # paying for pose detection every frame otherwise.
+            # Tutorial and Rally both need a pose landmarker too (motion
+            # trajectories are scored from hand + upper-body movement
+            # together). Only set one up when a dynamic model was actually
+            # found - no point paying for pose detection every frame
+            # otherwise (Wordle-only sessions never touch it).
             pose_landmarker = None
             if self.dynamic_classifier is not None:
                 pose_options = vision.PoseLandmarkerOptions(
@@ -377,6 +629,25 @@ class GameOverlaySession:
                 )
                 results = landmarker.detect(mp_image)
 
+                # Wordle and Fingerspelling are scored per-frame from the
+                # static handshape model; Tutorial and Rally are scored
+                # from a whole buffered dynamic-sign clip instead (see
+                # below) - each mode uses exactly one of the two
+                # pipelines, never both.
+                wordle_active = self.screen == "playing" and (
+                    self.mode == "wordle" or (self.mode == "both" and self.manager.tutorial.is_complete())
+                )
+                fingerspell_active = (
+                    self.screen == "playing"
+                    and self.mode == "fingerspell"
+                    and not self.manager.fingerspelling.is_complete()
+                )
+                static_active = wordle_active or fingerspell_active
+                dynamic_active = self.screen == "playing" and (
+                    self.mode == "rally"
+                    or (self.mode in {"tutorial", "both"} and not self.manager.tutorial.is_complete())
+                )
+
                 if results.hand_landmarks:
                     hand_landmarks = results.hand_landmarks[0]
                     raw = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks])
@@ -389,71 +660,71 @@ class GameOverlaySession:
 
                     # Only score a transition into a new stable sign, not
                     # every frame it stays held, so one held sign yields one
-                    # performance-log entry instead of dozens. Rally uses
-                    # its own hand+pose buffering below, not this
-                    # single-frame classifier, so it's skipped there.
-                    if (
-                        self.screen == "playing"
-                        and self.mode != "rally"
-                        and stable_label
-                        and stable_label != self._last_stable_label
-                    ):
+                    # performance-log entry instead of dozens.
+                    if static_active and stable_label and stable_label != self._last_stable_label:
                         self._handle_prediction(stable_label)
                     self._last_stable_label = stable_label
 
-                    for lm in hand_landmarks:
-                        x = int(lm.x * frame.shape[1])
-                        y = int(lm.y * frame.shape[0])
-                        cv2.circle(frame, (x, y), 3, (0, 255, 0), -1)
+                    self._draw_hand_skeleton(frame, hand_landmarks)
 
-                    if self.screen == "playing" and self.mode == "rally" and pose_landmarker is not None:
+                    if dynamic_active and pose_landmarker is not None:
                         pose_results = pose_landmarker.detect(mp_image)
                         if pose_results.pose_landmarks:
                             pose_arr = np.array(
                                 [[lm.x, lm.y, lm.z] for lm in pose_results.pose_landmarks[0]]
                             )
-                            self._rally_buffer.append(extract_body_features(raw, pose_arr, dominant_side="right"))
-                            self._rally_was_visible = True
-                        elif self._rally_was_visible:
-                            self._finish_rally_buffer()
-                            self._rally_was_visible = False
+                            self._dynamic_buffer.append(extract_body_features(raw, pose_arr, dominant_side="right"))
+                            self._dynamic_was_visible = True
+                        elif self._dynamic_was_visible:
+                            self._finish_dynamic_buffer()
+                            self._dynamic_was_visible = False
                 else:
                     self.current_signal = "UNKNOWN"
                     self.current_confidence = 0.0
                     self._last_stable_label = None
-                    if self.screen == "playing":
-                        if self.mode == "rally":
-                            if self._rally_was_visible:
-                                self._finish_rally_buffer()
-                                self._rally_was_visible = False
-                        else:
-                            self.status_message = "No hand detected. Move into frame."
+                    if dynamic_active:
+                        if self._dynamic_was_visible:
+                            self._finish_dynamic_buffer()
+                            self._dynamic_was_visible = False
+                    elif static_active:
+                        self.status_message = "No hand detected. Move into frame."
 
                 if self.screen == "playing" and self.mode == "rally":
                     timeout_result = self.manager.check_rally_timeout()
                     if timeout_result is not None:
-                        self._rally_buffer = []
-                        self._rally_was_visible = False
+                        self._dynamic_buffer = []
+                        self._dynamic_was_visible = False
                         self._apply_rally_result(timeout_result)
 
                 if self.screen == "start":
                     self._draw_start_screen(frame)
                 else:
                     self._sync_lesson_timer()
+                    self._sync_letter_timer()
+                    tutorial_active = self.mode in {"tutorial", "both"} and not self.manager.tutorial.is_complete()
 
                     if self.mode == "rally":
                         prompt = self._rally_prompt()
-                    elif self.mode in {"tutorial", "both"} and not self.manager.tutorial.is_complete():
+                    elif tutorial_active:
                         prompt = self._tutorial_prompt()
+                    elif fingerspell_active:
+                        prompt = self._fingerspell_prompt()
                     elif self.mode in {"wordle", "both"} and self.manager.tutorial.is_complete():
                         prompt = self._wordle_prompt()
                     else:
                         prompt = "Game complete"
 
-                    if self.mode == "rally":
+                    if tutorial_active:
+                        self._draw_tutorial_demo(frame)
+                    elif fingerspell_active:
+                        self._draw_letter_demo(frame)
+                    elif wordle_active:
+                        self._draw_wordle_board(frame)
+
+                    if dynamic_active:
                         detected_line = (
-                            f"Buffering: {len(self._rally_buffer)} frames"
-                            if self._rally_was_visible
+                            f"Buffering: {len(self._dynamic_buffer)} frames"
+                            if self._dynamic_was_visible
                             else "Show your hand + upper body to sign"
                         )
                     else:
@@ -466,7 +737,7 @@ class GameOverlaySession:
                     self._draw_text(frame, self.status_message, 150, color=(0, 255, 255), scale=0.6)
                     self._draw_text(
                         frame,
-                        "Press T/W/G/B/R for modes | N for next participant | Q to quit",
+                        "Press T/W/G/B/R/F for modes | N for next participant | Q to quit",
                         frame.shape[0] - 20,
                         color=(255, 255, 255),
                         scale=0.6,
@@ -505,7 +776,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Launch the ASL game with a live webcam overlay.")
     parser.add_argument(
         "--mode",
-        choices=["tutorial", "wordle", "both", "rally"],
+        choices=["tutorial", "wordle", "both", "rally", "fingerspell"],
         default=None,
         help="Skip the start screen and launch directly in this mode.",
     )

@@ -2,8 +2,11 @@
 
 from .config import (
     DEFAULT_MODEL_CANDIDATES,
+    DYNAMIC_SIGN_CLIPS_DIR,
     DYNAMIC_SIGN_WORDS,
+    FINGERSPELLING_LETTERS,
     RESULTS_DIR,
+    STATIC_SIGN_IMAGES_DIR,
     TRAINING_PROJECT_ROOT,
 )
 from .game_manager import GameManager, PlayerProgress
@@ -29,6 +32,9 @@ __all__ = [
     "WordleGame",
     "TRAINING_PROJECT_ROOT",
     "DEFAULT_MODEL_CANDIDATES",
+    "DYNAMIC_SIGN_CLIPS_DIR",
     "DYNAMIC_SIGN_WORDS",
+    "FINGERSPELLING_LETTERS",
     "RESULTS_DIR",
+    "STATIC_SIGN_IMAGES_DIR",
 ]

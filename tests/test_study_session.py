@@ -101,3 +101,22 @@ def test_rally_attempts_are_logged_and_summarised(tmp_path):
     assert summary["rally_attempts"] == 2
     assert summary["rally_correct_attempts"] == 1
     assert summary["rally_best_streak"] == 1
+
+
+def test_fingerspelling_results_are_logged_and_summarised(tmp_path):
+    study = StudySession(results_dir=tmp_path)
+
+    manager = study.start_participant("P001")
+    lesson = manager.fingerspelling.current_lesson()
+    manager.fingerspelling.mark_completed(lesson)
+    study.record_fingerspelling_result(lesson.word, True, 1.2)
+
+    next_lesson = manager.fingerspelling.current_lesson()
+    study.record_fingerspelling_result(next_lesson.word, False, 3.0)
+
+    summary = study.reset_for_next_player()
+
+    assert summary["fingerspelling_lessons_completed"] == 1
+    assert summary["fingerspelling_total_lessons"] == 26
+    assert summary["fingerspelling_avg_response_time_seconds"] == 2.1
+    assert summary["fingerspelling_complete"] is False

@@ -20,11 +20,16 @@ class WordleGame:
         self.allowed_words = allowed_words or WORDLE_ALLOWED_WORDS
         self.target_word = target_word or self.allowed_words[0]
         self.guesses: List[str] = []
+        # Full feedback (not just the raw guess) for every guess made this
+        # round, in order - lets a UI redraw the whole board (e.g. a tile
+        # grid) without recomputing each pattern itself.
+        self.history: List[GuessFeedback] = []
         self.max_guesses = 6
 
     def reset(self, target_word: str | None = None) -> None:
         self.target_word = target_word or self.allowed_words[0]
         self.guesses = []
+        self.history = []
 
     def validate_guess(self, guess: str) -> bool:
         guess = guess.strip().upper()
@@ -45,6 +50,7 @@ class WordleGame:
 
         feedback = GuessFeedback(guess=guess, pattern=pattern, correct=guess == self.target_word)
         self.guesses.append(guess)
+        self.history.append(feedback)
         return feedback
 
     def is_won(self) -> bool:

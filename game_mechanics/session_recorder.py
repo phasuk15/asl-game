@@ -16,6 +16,10 @@ SUMMARY_FIELDS = [
     "tutorial_lessons_completed",
     "tutorial_total_lessons",
     "tutorial_avg_response_time_seconds",
+    "fingerspelling_complete",
+    "fingerspelling_lessons_completed",
+    "fingerspelling_total_lessons",
+    "fingerspelling_avg_response_time_seconds",
     "wordle_attempts",
     "wordle_correct_guesses",
     "wordle_won",
@@ -36,7 +40,8 @@ def _normalise(value: str | None) -> str:
 
 @dataclass
 class PerformanceEvent:
-    """A single scored interaction: one tutorial sign or one wordle guess."""
+    """A single scored interaction: one tutorial sign, fingerspelled letter,
+    wordle guess, or rally attempt."""
 
     phase: str
     target: str
@@ -99,6 +104,7 @@ def _average_response_time(events: List[PerformanceEvent]) -> float:
 def build_summary(recorder: SessionRecorder, manager) -> dict:
     """Combine a recorder's raw events with the manager's final state into one row."""
     tutorial_events = recorder.events_for("tutorial")
+    fingerspelling_events = recorder.events_for("fingerspelling")
     wordle_events = recorder.events_for("wordle")
     rally_events = recorder.events_for("rally")
     rally = getattr(manager, "rally", None)
@@ -118,6 +124,10 @@ def build_summary(recorder: SessionRecorder, manager) -> dict:
         "tutorial_lessons_completed": sum(1 for lesson in manager.tutorial.lessons if lesson.completed),
         "tutorial_total_lessons": len(manager.tutorial.lessons),
         "tutorial_avg_response_time_seconds": _average_response_time(tutorial_events),
+        "fingerspelling_complete": manager.progress.fingerspelling_complete,
+        "fingerspelling_lessons_completed": sum(1 for lesson in manager.fingerspelling.lessons if lesson.completed),
+        "fingerspelling_total_lessons": len(manager.fingerspelling.lessons),
+        "fingerspelling_avg_response_time_seconds": _average_response_time(fingerspelling_events),
         "wordle_attempts": len(wordle_events),
         "wordle_correct_guesses": sum(1 for event in wordle_events if event.correct),
         "wordle_won": manager.wordle.is_won(),
