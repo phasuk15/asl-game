@@ -110,6 +110,12 @@ class GameOverlaySession:
             )
 
         self.wordle = self.manager.start_wordle_session()
+        # Wordle guesses are spelled one confirmed letter at a time: SPACE
+        # locks in whatever letter is currently detected (see
+        # _submit_wordle_letter()) rather than trying to match a whole word
+        # against a single classification, which the static model - it only
+        # ever outputs one letter - could never realistically produce.
+        self._wordle_current_guess = ""
         self.status_message = "Waiting for hand detection..."
         self.current_signal = "UNKNOWN"
         self.current_confidence = 0.0
@@ -258,8 +264,9 @@ class GameOverlaySession:
 
     def _draw_wordle_board(self, frame) -> None:
         """Draw a tile-grid board like the real Wordle: filled coloured
-        tiles for past guesses (from wordle.history), empty outlined tiles
-        for guesses not yet made."""
+        tiles for past guesses (from wordle.history), the letters typed so
+        far into the current guess (unscored, dark-outlined - see
+        _submit_wordle_letter()), and empty outlined tiles beyond that."""
         wordle = self.wordle
         word_len = len(wordle.target_word)
         rows = wordle.max_guesses
@@ -290,6 +297,7 @@ class GameOverlaySession:
 
         for row in range(rows):
             feedback = wordle.history[row] if row < len(wordle.history) else None
+            is_current_row = feedback is None and row == len(wordle.history)
             for col in range(word_len):
                 cx = grid_x + col * (cell + gap)
                 cy = grid_y + row * (cell + gap)
@@ -299,6 +307,11 @@ class GameOverlaySession:
                     tile_color = self._WORDLE_TILE_COLORS[feedback.pattern[col]]
                     cv2.rectangle(frame, (cx, cy), (cx + cell, cy + cell), tile_color, -1)
                     text_color = (255, 255, 255)
+                elif is_current_row and col < len(self._wordle_current_guess):
+                    letter = self._wordle_current_guess[col]
+                    cv2.rectangle(frame, (cx, cy), (cx + cell, cy + cell), (255, 255, 255), -1)
+                    cv2.rectangle(frame, (cx, cy), (cx + cell, cy + cell), (40, 40, 40), 2)
+                    text_color = (40, 40, 40)
                 else:
                     letter = ""
                     cv2.rectangle(frame, (cx, cy), (cx + cell, cy + cell), (255, 255, 255), -1)
@@ -342,6 +355,7 @@ class GameOverlaySession:
         self._current_letter = None
         self._letter_started_at = time.time()
         self._letter_image = None
+        self._wordle_current_guess = ""
         self.status_message = f"Ready for participant {self.study.participant_id}."
         print(f"Started session for participant {self.study.participant_id}.")
 
@@ -390,10 +404,12 @@ class GameOverlaySession:
             self.wordle = self.manager.start_wordle_session()
             self.status_message = "Wordle mode activated."
             self._wordle_last_action_at = time.time()
+            self._wordle_current_guess = ""
         elif self.mode == "both":
             self.status_message = "Tutorial + Wordle mode activated."
             self._current_lesson_word = None
             self._wordle_last_action_at = time.time()
+            self._wordle_current_guess = ""
         elif self.mode == "rally":
             rally = self.manager.start_rally_session()
             self._dynamic_buffer = []
@@ -430,7 +446,8 @@ class GameOverlaySession:
         return f"Tutorial: show {lesson.word}"
 
     def _wordle_prompt(self) -> str:
-        return f"Wordle: sign a {len(self.wordle.target_word)}-letter word"
+        typed, total = len(self._wordle_current_guess), len(self.wordle.target_word)
+        return f"Wordle: sign a letter, SPACE to add it ({typed}/{total})"
 
     def _fingerspell_prompt(self) -> str:
         lesson = self.manager.fingerspelling.current_lesson()
@@ -471,10 +488,11 @@ class GameOverlaySession:
             cv2.circle(frame, point, 3, (0, 255, 0), -1)
 
     def _handle_prediction(self, label: str) -> None:
-        """Single-frame static-model path, used for Wordle and
-        Fingerspelling (both static handshapes): dynamic signs (Tutorial,
-        Rally) are scored from buffered clips instead - see
-        _finish_dynamic_buffer()."""
+        """Single-frame static-model path, used for Fingerspelling: each
+        stable sign is auto-scored the instant it's held. Wordle uses the
+        same static classifier's live output too, but doesn't auto-score
+        from it - see _submit_wordle_letter() - since the model only ever
+        classifies one letter at a time, never a whole word."""
         label = label.strip().upper()
         self.current_signal = label
 
@@ -496,20 +514,44 @@ class GameOverlaySession:
                     self.status_message = f"Next: show {next_lesson.word}"
             else:
                 self.status_message = f"Fingerspell: show {lesson.word} (saw {label})"
+
+    def _submit_wordle_letter(self) -> None:
+        """SPACE: lock in whatever static sign is currently detected as the
+        next letter of the guess being spelled out. Once enough letters
+        have been confirmed to match the target word's length, the guess
+        is submitted to Wordle automatically."""
+        if self.screen != "playing" or self.mode not in {"wordle", "both"}:
+            return
+        if self.mode == "both" and not self.manager.tutorial.is_complete():
+            return  # tutorial is still the active phase in "both" mode
+
+        letter = self.current_signal
+        if len(letter) != 1 or not letter.isalpha():
+            self.status_message = "No letter detected to add - hold a clear sign first."
             return
 
-        if self.wordle.validate_guess(label):
-            response_time = time.time() - self._wordle_last_action_at
-            target_word = self.wordle.target_word
-            feedback = self.manager.process_guess(label)
-            self.study.record_wordle_guess(target_word, label, feedback["correct"], response_time)
-            self._wordle_last_action_at = time.time()
-            self.status_message = f"Guess {label}: {feedback['pattern']}"
-            if feedback["correct"]:
-                self.status_message = "You solved the word!"
-                self.wordle = self.manager.start_wordle_session()
-        else:
-            self.status_message = f"Wordle: {self.wordle.target_word} (invalid guess: {label})"
+        self._wordle_current_guess += letter
+        self.status_message = f"Added '{letter}' -> {self._wordle_current_guess}"
+
+        if len(self._wordle_current_guess) < len(self.wordle.target_word):
+            return
+
+        guess = self._wordle_current_guess
+        self._wordle_current_guess = ""
+
+        if not self.wordle.validate_guess(guess):
+            self.status_message = f"'{guess}' isn't a valid word - spell your guess again."
+            return
+
+        response_time = time.time() - self._wordle_last_action_at
+        target_word = self.wordle.target_word
+        feedback = self.manager.process_guess(guess)
+        self.study.record_wordle_guess(target_word, guess, feedback["correct"], response_time)
+        self._wordle_last_action_at = time.time()
+        self.status_message = f"Guess {guess}: {feedback['pattern']}"
+        if feedback["correct"]:
+            self.status_message = "You solved the word!"
+            self.wordle = self.manager.start_wordle_session()
 
     def _handle_tutorial_dynamic_sign(self, detected: str, raw_label: str) -> None:
         """Score one classified dynamic-sign clip against the current
@@ -529,6 +571,7 @@ class GameOverlaySession:
                     self.mode = "wordle"
                     self.wordle = self.manager.start_wordle_session()
                     self._wordle_last_action_at = time.time()
+                    self._wordle_current_guess = ""
             else:
                 self._current_lesson_word = next_lesson.word
                 self._lesson_started_at = time.time()
@@ -629,10 +672,12 @@ class GameOverlaySession:
                 )
                 results = landmarker.detect(mp_image)
 
-                # Wordle and Fingerspelling are scored per-frame from the
-                # static handshape model; Tutorial and Rally are scored
-                # from a whole buffered dynamic-sign clip instead (see
-                # below) - each mode uses exactly one of the two
+                # Wordle and Fingerspelling both read the static handshape
+                # model's per-frame output; Fingerspelling auto-scores each
+                # stable sign, Wordle only commits one on a SPACE press
+                # (see _submit_wordle_letter()). Tutorial and Rally are
+                # scored from a whole buffered dynamic-sign clip instead
+                # (see below) - every mode uses exactly one of the two
                 # pipelines, never both.
                 wordle_active = self.screen == "playing" and (
                     self.mode == "wordle" or (self.mode == "both" and self.manager.tutorial.is_complete())
@@ -660,8 +705,11 @@ class GameOverlaySession:
 
                     # Only score a transition into a new stable sign, not
                     # every frame it stays held, so one held sign yields one
-                    # performance-log entry instead of dozens.
-                    if static_active and stable_label and stable_label != self._last_stable_label:
+                    # performance-log entry instead of dozens. Wordle reads
+                    # this same live signal for display, but only commits a
+                    # letter to its guess on a SPACE press - see
+                    # _submit_wordle_letter() - not automatically here.
+                    if fingerspell_active and stable_label and stable_label != self._last_stable_label:
                         self._handle_prediction(stable_label)
                     self._last_stable_label = stable_label
 
@@ -737,7 +785,7 @@ class GameOverlaySession:
                     self._draw_text(frame, self.status_message, 150, color=(0, 255, 255), scale=0.6)
                     self._draw_text(
                         frame,
-                        "Press T/W/G/B/R/F for modes | N for next participant | Q to quit",
+                        "T/W/G/B/R/F modes | SPACE = Wordle letter | N = next | Q = quit",
                         frame.shape[0] - 20,
                         color=(255, 255, 255),
                         scale=0.6,
@@ -751,6 +799,10 @@ class GameOverlaySession:
 
                 if key in {ord("n"), ord("N")}:
                     self._start_next_participant()
+                    continue
+
+                if key == ord(" "):
+                    self._submit_wordle_letter()
                     continue
 
                 next_mode = self._key_to_mode(key)

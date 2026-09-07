@@ -99,9 +99,9 @@ share. `GameManager.fingerspelling` is a `TutorialPhase` built via
 machinery as the dynamic Tutorial, just pointed at a different word list.
 `manager.run_fingerspelling()` mirrors `run_tutorial()` for scripted use.
 
-## Wordle: a real tile-grid board
+## Wordle: a real tile-grid board, spelled one letter at a time
 
-`WordleGame` now keeps a full `history` of `GuessFeedback` (guess + per-letter
+`WordleGame` keeps a full `history` of `GuessFeedback` (guess + per-letter
 GREEN/YELLOW/GREY pattern) for the round, not just the raw guessed words -
 [game_mechanics/wordle.py](game_mechanics/wordle.py) - so a UI can redraw the
 whole board without recomputing anything itself.
@@ -109,10 +109,23 @@ whole board without recomputing anything itself.
 In the live webcam overlay, `_draw_wordle_board()` renders that history as an
 actual tile grid in the corner of the frame: filled, coloured tiles (matching
 the real Wordle's green/yellow/grey palette) for guesses already made, empty
-outlined tiles for the guesses still to come, sized to the current target
-word's length (4-6 letters depending which `WORDLE_ALLOWED_WORDS` entry is
-active) and `WordleGame.max_guesses` rows. The on-screen prompt no longer
-spells out the target word, since the board is now the actual game surface.
+outlined tiles for guesses still to come, sized to the current target word's
+length (4-6 letters depending which `WORDLE_ALLOWED_WORDS` entry is active)
+and `WordleGame.max_guesses` rows. The on-screen prompt no longer spells out
+the target word, since the board is now the actual game surface.
+
+A guess is spelled one confirmed letter at a time rather than matched from a
+single live classification - the static model only ever recognises one
+letter per frame, so it could never realistically produce a whole word in
+one shot. `SPACE` locks in whatever letter is currently detected
+(`_submit_wordle_letter()` in
+[examples/live_webcam.py](examples/live_webcam.py)); each confirmed letter
+appears immediately in the board's current row as a dark-outlined (unscored)
+tile, distinct from the light-grey empty tiles still to come. Once enough
+letters have been confirmed to match the target word's length, the guess is
+validated and submitted to `WordleGame` automatically - an invalid word
+clears the in-progress guess and asks the player to spell it again; pressing
+`SPACE` with no clear hand sign just prompts them to hold a sign first.
 
 ## Timed Rally / Streak mode
 
@@ -216,6 +229,9 @@ reading the menu never counts toward response times:
   whether the previous one is still running or has finished.
 - Once playing, `T` / `G` / `B` / `R` / `F` switch modes directly, same as
   the start screen.
+- `SPACE` — while playing Wordle, locks in the currently-detected letter as
+  the next letter of the guess being spelled out (see above); submitted
+  automatically once it reaches the target word's length.
 - `N` saves the current player's results, resets all game state, prompts in
   the terminal for the next participant's ID, and returns to the start
   screen — ready for the next person in the study without restarting the app.
