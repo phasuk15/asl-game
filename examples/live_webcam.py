@@ -548,7 +548,13 @@ class GameOverlaySession:
         feedback = self.manager.process_guess(guess)
         self.study.record_wordle_guess(target_word, guess, feedback["correct"], response_time)
         self._wordle_last_action_at = time.time()
-        self.status_message = f"Guess {guess}: {feedback['pattern']}"
+
+        # The board (green/yellow/grey tiles, just like the real game)
+        # already shows this guess's result in full - the status line is
+        # just a plain-English recap, not a dump of the raw pattern list.
+        correct_count = feedback["pattern"].count("GREEN")
+        present_count = feedback["pattern"].count("YELLOW")
+        self.status_message = f"Guessed {guess}: {correct_count} correct, {present_count} present"
         if feedback["correct"]:
             self.status_message = "You solved the word!"
             self.wordle = self.manager.start_wordle_session()
