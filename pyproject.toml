@@ -14,5 +14,8 @@ dependencies = [
   "mediapipe",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [tool.setuptools]
 packages = ["game_mechanics"]

@@ -66,6 +66,9 @@ class GameOverlaySession:
         "GREY": (126, 124, 120),
     }
     _WORDLE_EMPTY_BORDER = (218, 214, 211)
+    # How long a solved board stays on screen (colours and all) before
+    # auto-advancing to the next word - SPACE skips the wait immediately.
+    _WORDLE_WIN_PAUSE_SECONDS = 3.0
 
     def __init__(self, mode: str | None = None, participant_id: str | None = None):
         # The session opens on a start screen where the player picks a mode
@@ -116,6 +119,10 @@ class GameOverlaySession:
         # against a single classification, which the static model - it only
         # ever outputs one letter - could never realistically produce.
         self._wordle_current_guess = ""
+        # Set the instant a round is won; the board (with its winning green
+        # row) stays up until this pause elapses or SPACE dismisses it
+        # early - see _submit_wordle_letter() and run()'s auto-advance check.
+        self._wordle_round_won_at: float | None = None
         self.status_message = "Waiting for hand detection..."
         self.current_signal = "UNKNOWN"
         self.current_confidence = 0.0
@@ -356,6 +363,7 @@ class GameOverlaySession:
         self._letter_started_at = time.time()
         self._letter_image = None
         self._wordle_current_guess = ""
+        self._wordle_round_won_at = None
         self.status_message = f"Ready for participant {self.study.participant_id}."
         print(f"Started session for participant {self.study.participant_id}.")
 
@@ -405,11 +413,13 @@ class GameOverlaySession:
             self.status_message = "Wordle mode activated."
             self._wordle_last_action_at = time.time()
             self._wordle_current_guess = ""
+            self._wordle_round_won_at = None
         elif self.mode == "both":
             self.status_message = "Tutorial + Wordle mode activated."
             self._current_lesson_word = None
             self._wordle_last_action_at = time.time()
             self._wordle_current_guess = ""
+            self._wordle_round_won_at = None
         elif self.mode == "rally":
             rally = self.manager.start_rally_session()
             self._dynamic_buffer = []
@@ -446,6 +456,8 @@ class GameOverlaySession:
         return f"Tutorial: show {lesson.word}"
 
     def _wordle_prompt(self) -> str:
+        if self._wordle_round_won_at is not None:
+            return "Solved! Press SPACE for the next word"
         typed, total = len(self._wordle_current_guess), len(self.wordle.target_word)
         return f"Wordle: sign a letter, SPACE to add it ({typed}/{total})"
 
@@ -515,15 +527,29 @@ class GameOverlaySession:
             else:
                 self.status_message = f"Fingerspell: show {lesson.word} (saw {label})"
 
+    def _start_next_wordle_round(self) -> None:
+        """Clear a just-solved board and begin a fresh Wordle round -
+        called once the win pause elapses, or immediately on a SPACE press
+        while waiting it out."""
+        self.wordle = self.manager.start_wordle_session()
+        self._wordle_current_guess = ""
+        self._wordle_round_won_at = None
+        self.status_message = f"New word! Sign a {len(self.wordle.target_word)}-letter word."
+
     def _submit_wordle_letter(self) -> None:
         """SPACE: lock in whatever static sign is currently detected as the
         next letter of the guess being spelled out. Once enough letters
         have been confirmed to match the target word's length, the guess
-        is submitted to Wordle automatically."""
+        is submitted to Wordle automatically. While a just-solved board is
+        still on screen, SPACE instead skips the win pause immediately."""
         if self.screen != "playing" or self.mode not in {"wordle", "both"}:
             return
         if self.mode == "both" and not self.manager.tutorial.is_complete():
             return  # tutorial is still the active phase in "both" mode
+
+        if self._wordle_round_won_at is not None:
+            self._start_next_wordle_round()
+            return
 
         letter = self.current_signal
         if len(letter) != 1 or not letter.isalpha():
@@ -556,8 +582,11 @@ class GameOverlaySession:
         present_count = feedback["pattern"].count("YELLOW")
         self.status_message = f"Guessed {guess}: {correct_count} correct, {present_count} present"
         if feedback["correct"]:
-            self.status_message = "You solved the word!"
-            self.wordle = self.manager.start_wordle_session()
+            self.status_message = "You solved the word! Press SPACE to continue."
+            # Don't reset the board yet - wordle.history still holds this
+            # winning guess, and it needs to actually be drawn at least
+            # once (with its green tiles) before a fresh round wipes it.
+            self._wordle_round_won_at = time.time()
 
     def _handle_tutorial_dynamic_sign(self, detected: str, raw_label: str) -> None:
         """Score one classified dynamic-sign clip against the current
@@ -578,6 +607,7 @@ class GameOverlaySession:
                     self.wordle = self.manager.start_wordle_session()
                     self._wordle_last_action_at = time.time()
                     self._wordle_current_guess = ""
+                    self._wordle_round_won_at = None
             else:
                 self._current_lesson_word = next_lesson.word
                 self._lesson_started_at = time.time()
@@ -758,6 +788,14 @@ class GameOverlaySession:
                         self._dynamic_buffer = []
                         self._dynamic_was_visible = False
                         self._apply_rally_result(timeout_result)
+
+                if (
+                    self.screen == "playing"
+                    and self.mode in {"wordle", "both"}
+                    and self._wordle_round_won_at is not None
+                    and time.time() - self._wordle_round_won_at >= self._WORDLE_WIN_PAUSE_SECONDS
+                ):
+                    self._start_next_wordle_round()
 
                 if self.screen == "start":
                     self._draw_start_screen(frame)

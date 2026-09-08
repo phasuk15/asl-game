@@ -219,3 +219,6 @@ __marimo__/
 
 # Per-participant user-test results (performance_log.csv + raw event JSON)
 /results/
+
+# macOS
+.DS_Store

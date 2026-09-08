@@ -80,6 +80,7 @@ WORDLE_ALLOWED_WORDS = [
     "DANCE",
     "BASIC",
     "ALPHA",
+    "SLEEP",
 ]
 
 # Timed Rally / Streak mode pacing: a round lasts RALLY_ROUND_SECONDS in
